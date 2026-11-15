@@ -1,0 +1,131 @@
+QUALIFICATION CONTRACT
+Owner-side qualification tooling: evidence-bundle packager and verifier.
+Python 3 standard library only. Ordinary defensive code: no root, no
+mounts, no environment or sandbox mechanics. ctypes is used solely for
+the renameat2 no-overwrite syscall.
+
+COMPONENTS
+- packager.py (producer): builds an evidence bundle - a directory of
+  evidence files plus manifest.json - and publishes it. The producer
+  emits evidence and a manifest only. It never emits a verdict.
+- verifier.py (consumer): validates a published bundle and emits the
+  verdict. Only the verifier emits verdicts. A verdict exists only after
+  complete validation of the exact bundle it names, and it binds the
+  manifest-DECLARED bundle name, the bundle's absolute path, and the
+  bundle's manifest sha256. A verdict for an absent, moved, renamed, or
+  changed bundle is invalid on its face.
+- checks.py (gate): 16 checks over the packager and verifier, using real
+  mechanisms only: real SIGKILLs of a real subprocess, a real OS write
+  error, and a real second filesystem for the cross-device case.
+
+GUARANTEES
+- Atomic visibility. The published path appears only through one atomic
+  renameat2(RENAME_NOREPLACE) on Linux/x86-64 in a 64-bit process
+  (pointer-size guard included). Before that rename, nothing partial
+  exists at the published path. After it, the bundle is complete and
+  valid; a kill after publish may leave a complete bundle - stated, not
+  hidden.
+- Fail-closed platform guard. Any other platform, architecture, process
+  width, or a kernel without renameat2 refuses to publish. There is no
+  racy check-then-rename fallback.
+- No overwrite. An existing target is never replaced. The guarantee
+  rests on renameat2(RENAME_NOREPLACE) syscall semantics.
+- Live staging namespace is locked for cooperating participants. The
+  packager creates a reservation directory outside the staging namespace
+  and valid bundle names, locks it with flock, verifies its identity,
+  then renames it without overwrite into the staging namespace. Every
+  staging directory this version creates is therefore locked from the
+  moment it has a staging name through the publish rename. A cooperating
+  sweep skips and reports staging it cannot lock. Reservations are
+  reported as skipped and never swept. If a pack dies before the staging
+  rename, its reservation remains until an operator removes it knowing
+  no pack is using it. Death after that rename releases the lock, leaving
+  staging residue sweepable. Earlier producers retain their creation-to-
+  lock gap, including with a new sweep. flock is advisory; non-cooperating
+  processes and concurrent hostile namespace replacement are outside
+  this guarantee. Sweep results list removed and skipped entries; a
+  skipped entry is not proof that an attempted removal left it untouched.
+- Fail-closed consumption. Absent, missing, incomplete, mismatched, or
+  unknown-framing bundles are invalid. Stale verdicts (changed evidence)
+  and foreign verdicts (different bundle) are rejected against the
+  current bytes and identity. An evidence file named manifest.json is
+  refused as input (reserved-name collision). Abusive bundle names are
+  rejected before any staging is created. Staging on a different
+  filesystem than the publish target is rejected before any evidence
+  content is written.
+
+NON-CLAIMS
+- No power-loss durability proof.
+- Staging cleanup on interruption is not guaranteed. The guarantee is
+  inverted: unpublished staging can never masquerade as complete,
+  because only the exact published path with a complete manifest is
+  trusted.
+- Verdicts are not signatures and do not prove authorship or
+  authenticity.
+- The gate qualifies packager/verifier behavior only. It certifies
+  nothing about any other system, suite, or property.
+
+USAGE
+    python3 checks.py
+    python3 packager.py EVIDENCE_DIR OUT_PARENT BUNDLE_NAME
+    python3 packager.py --recover-sweep OUT_PARENT
+    python3 verifier.py BUNDLE_PATH
+    python3 verifier.py --check-verdict BUNDLE_PATH VERDICT_PATH
+
+CHECK DEFINITIONS (what the gate's 16 checks verify)
+- F1: pack publishes a complete bundle; producer output carries no
+  verdict.
+- F2: a verdict binds the bundle identity and the manifest sha256.
+- F3: republishing over an existing bundle is refused; the existing
+  bundle is untouched.
+- F4: no-overwrite race - an empty target appearing mid-run is never
+  replaced, with a control showing plain rename would replace it. The
+  full no-overwrite guarantee rests on syscall semantics, not on this
+  empirical window.
+- C1-a: a real SIGKILL mid-stage produces no publish and no verdict;
+  the residue is rejected.
+- C1-b: a real OS write error abandons the run before publish with a
+  nonzero exit and no verdict.
+- C1-c: real SIGKILLs at every point leave nothing partial before the
+  rename and a complete bundle after.
+- C1-d: path-abuse bundle names are rejected before staging.
+- C1-e: cross-filesystem staging is rejected on a real second
+  filesystem.
+- C1-f: the consumer fails closed on absent, missing, incomplete,
+  mismatched, and unknown-framing bundles.
+- C1-g: stale and foreign verdicts are rejected against current bytes
+  and identity; a fresh verdict is accepted.
+- C1-h: an evidence file named manifest.json is rejected as input.
+- C2-a: producer fixtures carry evidence fields only; no verdict field
+  exists anywhere in the producer schema.
+- C3-a: a sweep during a pack skips the live locked staging and the
+  pack publishes a complete VALID bundle.
+- C3-b: symlinked staging is skipped and reported skipped, never
+  removed or claimed as removed.
+- C3-c: a sweep on a missing OUT_PARENT refuses cleanly.
+
+QUALIFICATION RUNS
+November 12, 2026: the 16-check gate passed 16 of 16 on the current
+sources via bare `python3 checks.py` startup from the repository root
+and from a foreign working directory, using CPython 3.10.12 on
+unprivileged Linux x86-64.
+
+November 10, 2026 (accepted run, historical): the 16-check gate passed
+on the sources of that date, using CPython 3.10.12 on unprivileged
+Linux x86-64. The accepted run called the unchanged checks.main()
+after setting TMPDIR and assigning the checks module's SECOND_FS to
+fresh owned directories on actual different filesystems. This differs
+from bare command startup. Every registered check, assertion and the
+gate's failure loop remained unchanged. Both owned roots were observed
+empty afterward. The gate still continues after an individual failure;
+its nested subprocess output capture has no hard memory bound. The
+exact bytes of that run are recorded in docs/qualification-evidence.md.
+
+- CI qualification: on each pull request and push to main, all 16 checks
+  run on GitHub-hosted runners; nothing is excluded.
+
+Re-qualify with python3 checks.py in a safe owned environment, or the
+explicitly accepted scoped-directory invocation above. After any edit
+to the tool files, rerun the gate. Do not sweep
+a shared second-filesystem namespace merely to reproduce this command.
+See qualification-evidence.md for the evidence limits and known defects.
