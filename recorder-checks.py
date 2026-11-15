@@ -335,7 +335,33 @@ def r4(t: str) -> str:
     assert r.returncode == 1
     assert not os.path.exists(marker)
     assert not os.path.exists(orphan), "receipt written over orphan log"
-    return "receipt and log collisions refuse before launch"
+    # A symlink whose target is missing still takes the name.
+    for label, receipt_path, link in (
+        ("receipt", os.path.join(t, "dangling.json"), "dangling.json"),
+        ("log", os.path.join(t, "dangling-log.json"), "dangling-log.json.log"),
+    ):
+        link_path = os.path.join(t, link)
+        os.symlink(os.path.join(t, "missing-target"), link_path)
+        r = run(
+            [
+                RECORDER,
+                receipt_path,
+                "--cwd",
+                repo,
+                "--",
+                sys.executable,
+                "-c",
+                f"open({marker!r},'w').write('x')",
+            ]
+        )
+        assert r.returncode == 1, (label, r.returncode, r.stderr)
+        assert not os.path.exists(marker), f"command ran despite a dangling {label}"
+        assert os.readlink(link_path) == os.path.join(t, "missing-target"), label
+        assert not os.path.lexists(os.path.join(t, "missing-target")), label
+    return (
+        "receipt and log collisions, including dangling symlinks at either "
+        "path, refuse before launch"
+    )
 
 
 @check("R5 commit resolution fails closed outside a work tree")
