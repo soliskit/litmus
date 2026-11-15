@@ -24,8 +24,9 @@ Interrupt honesty:
   across power loss is UNTESTED and NOT claimed. Kill testing used real
   SIGKILLs at defined pause points between write steps; a kill mid-write
   of a single file and actual power loss are UNTESTED.
-- Leftover staging removal is a separate best-effort recovery sweep
-  (--recover-sweep), never a correctness condition.
+- Normal prepublication errors attempt to remove only this pack's own
+  staging. Interruptions and failed cleanup can leave residue; explicit
+  --recover-sweep remains best-effort recovery, not a correctness condition.
 
 Qualification driver hook: if C1C2_PAUSE_AT is set, the packager pauses
 INDEFINITELY at the named point until a resume file appears or the
@@ -261,6 +262,36 @@ def collect_evidence(evidence_dir: str) -> dict[str, str]:
     return entries
 
 
+def _cleanup_diagnostic(label: str, error: Exception) -> None:
+    # A secondary reporting failure must not replace the pack's original error.
+    try:
+        print(
+            f"warning: {label} ({error}); files may remain; use explicit recovery",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
+def _remove_own_staging(staging: str, staging_lock: int) -> None:
+    """Remove only the held, unpublished stage, under the cooperative protocol.
+
+    The path check does not defend against hostile replacement after inspection.
+    No permissions are changed and no other names are scanned.
+    """
+    import shutil
+
+    held = os.fstat(staging_lock)
+    named = os.stat(staging, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(held.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino)
+    ):
+        raise RuntimeError("own staging identity changed; cleanup refused")
+    shutil.rmtree(staging)
+
+
 def pack(
     evidence_dir: str,
     out_parent: str,
@@ -281,10 +312,12 @@ def pack(
     if os.path.exists(published):
         raise ValueError(f"published path already exists: {published}")
 
+    entries = collect_evidence(evidence_dir)
     stage_root = staging_parent if staging_parent is not None else out_parent
     staging, staging_lock = _locked_staging(stage_root, bundle_name)
     # A staging name exists only after its lock is held. Reservations
     # are not swept. Earlier producers retain their creation-to-lock gap.
+    published_ok = False
     try:
         _pause("after_staging_created", out_parent, bundle_name)
         # Same-filesystem guarantee, asserted with real device numbers before
@@ -292,7 +325,6 @@ def pack(
         if os.stat(staging).st_dev != os.stat(out_parent).st_dev:
             raise ValueError("cross-filesystem staging rejected")
 
-        entries = collect_evidence(evidence_dir)
         manifest_files: dict[str, dict[str, object]] = {}
         copied = 0
         for rel, src in entries.items():
@@ -324,8 +356,22 @@ def pack(
         if os.stat(staging).st_dev != os.stat(out_parent).st_dev:
             raise ValueError("cross-filesystem staging rejected")
         _rename_noreplace(staging, published)
+        published_ok = True
+    except Exception:
+        # Interrupts (BaseException) retain their existing exit behavior.
+        if not published_ok:
+            try:
+                _remove_own_staging(staging, staging_lock)
+            except Exception as cleanup_error:
+                _cleanup_diagnostic("own staging cleanup failed", cleanup_error)
+        raise
     finally:
-        os.close(staging_lock)
+        try:
+            os.close(staging_lock)
+        except Exception as close_error:
+            if published_ok:
+                raise
+            _cleanup_diagnostic("staging lock close failed", close_error)
     # Publish point: after this rename the bundle is complete and valid.
     # The parent-dir fsync below is attempted for crash ordering only;
     # its failure is reported as a warning and does not change the exit
