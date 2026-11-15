@@ -50,7 +50,8 @@ from datetime import datetime, timezone
 
 MANIFEST_VERSION = 1
 MANIFEST_FIELDS = {"version", "bundle", "created", "files"}
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# \Z, not $: $ also matches before a trailing newline.
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 STAGING_PREFIX = ".staging-"
 RESERVED_NAME = "manifest.json"
 

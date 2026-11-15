@@ -63,7 +63,8 @@ RECEIPT_FIELDS = {
     "output",
 }
 OUTPUT_FIELDS = {"path", "sha256", "bytes"}
-COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+# \Z, not $: $ also matches before a trailing newline.
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}\Z")
 LOG_SUFFIX = ".log"
 
 
