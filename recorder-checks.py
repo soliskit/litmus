@@ -11,6 +11,7 @@ about any run the recorder records.
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -52,8 +53,15 @@ def make_repo(root: str) -> str:
 def read_receipt(path: str) -> "tuple[recorder.Receipt, bytes]":
     with open(path, "rb") as f:
         raw = f.read()
-    receipt: recorder.Receipt = json.loads(raw.decode("utf-8"))
+    receipt: recorder.Receipt = json.loads(
+        raw.decode("utf-8"), parse_constant=reject_constant
+    )
     return receipt, raw
+
+
+def reject_constant(token: str) -> None:
+    """Receipts are strict JSON: NaN and Infinity are refused."""
+    raise ValueError(f"receipt is not strict JSON: {token}")
 
 
 def check(name: str) -> Callable[[Callable[[str], str]], Callable[[str], str]]:
@@ -139,51 +147,150 @@ def r2(t: str) -> str:
     return "exit 3 recorded; recorder exits 3"
 
 
-@check("R3 timeout kills the run's process group with a real SIGKILL")
-def r3(t: str) -> str:
-    repo = make_repo(t)
-    rp = os.path.join(t, "slow.json")
-    pidfile = os.path.join(t, "child.pid")
-    child = (
-        "import os,time; "
-        f"open({pidfile!r},'w').write(str(os.getpid())); "
+def gone(pid: int, wait: float = 5.0) -> bool:
+    """True once pid has exited. A killed process whose parent died may stay
+    a zombie until it is reaped; it counts as gone."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                state = f.read().rsplit(")", 1)[1].split()[0]
+        except FileNotFoundError:
+            return True
+        if state == "Z":
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+
+
+def group_child(pidfile: str, descendant_pidfile: str) -> str:
+    """A run whose child starts a background descendant in its own process
+    group, records both pids, then sleeps."""
+    return (
+        "import os, subprocess, sys, time; "
+        "d = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        f"open({descendant_pidfile!r}, 'w').write(str(d.pid)); "
+        f"open({pidfile!r}, 'w').write(str(os.getpid())); "
         "print('before-sleep', flush=True); time.sleep(60)"
     )
-    t0 = time.monotonic()
-    r = run(
-        [
-            RECORDER,
-            rp,
-            "--cwd",
-            repo,
-            "--timeout",
-            "1",
-            "--",
-            sys.executable,
-            "-c",
-            child,
-        ]
-    )
-    wall = time.monotonic() - t0
-    assert r.returncode == 124, (r.returncode, r.stderr)
-    assert wall < 20, f"kill did not return promptly: {wall:.1f}s"
-    receipt, _ = read_receipt(rp)
-    assert receipt["timed_out"] is True
-    assert receipt["exit"] is None
-    assert receipt["signal"] == 9
-    assert receipt["timeout_seconds"] == 1.0
-    with open(pidfile) as f:
-        pid = int(f.read())
+
+
+@check(
+    "R3 timeout or interrupt kills the run's process group with a real SIGKILL;"
+    " only a finite positive timeout is accepted"
+)
+def r3(t: str) -> str:
+    repo = make_repo(t)
+    marker = os.path.join(t, "should-not-exist")
+    for bad in ("nan", "inf", "-inf", "0", "-1"):
+        rp = os.path.join(t, f"bad-timeout-{bad}.json")
+        r = run(
+            [
+                RECORDER,
+                rp,
+                "--cwd",
+                repo,
+                "--timeout",
+                bad,
+                "--",
+                sys.executable,
+                "-c",
+                f"open({marker!r},'w').write('x')",
+            ]
+        )
+        assert r.returncode == 2, (bad, r.returncode, r.stderr)
+        assert not os.path.exists(marker), f"command ran with --timeout {bad}"
+        assert not os.path.exists(rp), f"receipt written with --timeout {bad}"
+    rp = os.path.join(t, "slow.json")
+    pidfile = os.path.join(t, "child.pid")
+    descendant_pidfile = os.path.join(t, "descendant.pid")
+    survivors: list[int] = []
     try:
-        os.kill(pid, 0)
-        alive = True
-    except ProcessLookupError:
-        alive = False
-    assert not alive, f"child process {pid} survived the timeout"
-    log = os.path.join(t, "slow.json.log")
-    with open(log, "rb") as f:
-        assert b"before-sleep" in f.read()
-    return "timed_out, null exit, signal 9; child really dead"
+        t0 = time.monotonic()
+        r = run(
+            [
+                RECORDER,
+                rp,
+                "--cwd",
+                repo,
+                "--timeout",
+                "1",
+                "--",
+                sys.executable,
+                "-c",
+                group_child(pidfile, descendant_pidfile),
+            ]
+        )
+        wall = time.monotonic() - t0
+        assert r.returncode == 124, (r.returncode, r.stderr)
+        assert wall < 20, f"kill did not return promptly: {wall:.1f}s"
+        receipt, _ = read_receipt(rp)
+        assert receipt["timed_out"] is True
+        assert receipt["exit"] is None
+        assert receipt["signal"] == 9
+        assert receipt["timeout_seconds"] == 1.0
+        for path in (pidfile, descendant_pidfile):
+            with open(path) as f:
+                survivors.append(int(f.read()))
+        alive = [pid for pid in survivors if not gone(pid)]
+        assert not alive, f"process group members {alive} survived the timeout"
+        log = os.path.join(t, "slow.json.log")
+        with open(log, "rb") as f:
+            assert b"before-sleep" in f.read()
+
+        # An interrupt to the recorder during the run kills the same group,
+        # long before the run's own deadline.
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            rp = os.path.join(t, f"interrupted-{sig.name}.json")
+            pidfile = os.path.join(t, f"{sig.name}.pid")
+            descendant_pidfile = os.path.join(t, f"{sig.name}-descendant.pid")
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    RECORDER,
+                    rp,
+                    "--cwd",
+                    repo,
+                    "--timeout",
+                    "60",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    group_child(pidfile, descendant_pidfile),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 20
+            while not os.path.exists(pidfile):
+                assert proc.poll() is None, proc.communicate()
+                assert time.monotonic() < deadline, "run never started"
+                time.sleep(0.05)
+            for path in (pidfile, descendant_pidfile):
+                with open(path) as f:
+                    survivors.append(int(f.read()))
+            proc.send_signal(sig)
+            _out, err = proc.communicate(timeout=20)
+            assert proc.returncode == 128 + sig, (sig.name, proc.returncode, err)
+            assert "Traceback" not in err, err
+            assert "interrupted" in json.loads(err)["error"], err
+            assert not os.path.exists(rp), f"receipt published after {sig.name}"
+            alive = [pid for pid in survivors[-2:] if not gone(pid)]
+            assert not alive, f"run's group members {alive} survived {sig.name}"
+    finally:
+        for pid in survivors:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    return (
+        "nan, inf, -inf, 0 and -1 timeouts refused before launch; timeout: "
+        "timed_out, null exit, signal 9, child and background descendant "
+        "really dead; SIGINT, SIGTERM and SIGHUP: group killed, no receipt, "
+        "exit 128 plus the signal"
+    )
 
 
 @check("R4 existing receipt or log refuses before the command starts")
