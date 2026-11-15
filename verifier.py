@@ -16,9 +16,16 @@ a stale or foreign verdict and is rejected. The path/name binding detects
 a moved, renamed or swapped bundle against a stored verdict; it is not a
 signature and proves nothing about who produced the verdict.
 
-Fail-closed: absent path, missing/incomplete manifest, hash or size
-mismatch, unexpected extra files, or unknown manifest framing all produce
-INVALID. Never emits a verdict for a bundle it could not fully read.
+Only the exact published directory validates: a path that is a symlink,
+or a directory whose name is not the valid bundle name its manifest
+declares, is INVALID. So unpublished staging, a copy under another name
+and a renamed bundle never validate.
+
+Fail-closed: absent path, missing/incomplete manifest, a manifest that is
+not a regular file, hash or size mismatch, unexpected extra files,
+symlinks or unreadable directories in the bundle, and unknown or
+malformed manifest framing all produce INVALID. Never emits VALID for a
+bundle it could not fully read.
 
 Python 3 standard library only.
 """
@@ -26,6 +33,8 @@ Python 3 standard library only.
 import hashlib
 import json
 import os
+import re
+import stat
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -33,6 +42,11 @@ from typing import TypedDict
 
 MANIFEST_VERSION = 1
 MANIFEST_FIELDS = {"version", "bundle", "created", "files"}
+FILE_FIELDS = {"sha256", "size"}
+# The packager's bundle name rule. A leading letter or digit also keeps
+# out ".", ".." and the ".staging-" prefix.
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
 VERDICT_FIELDS = {
     "verdict",
     "bundle",
@@ -63,9 +77,18 @@ def verify(bundle_path: str) -> Verdict:
         reasons.append("bundle path absent or not a directory")
         return _verdict("INVALID", bundle_name, bundle_path, manifest_sha256, reasons)
 
+    if os.path.islink(os.path.abspath(bundle_path)):
+        reasons.append("bundle path is a symlink, not the published directory")
+        return _verdict("INVALID", bundle_name, bundle_path, manifest_sha256, reasons)
+
     manifest_path = os.path.join(bundle_path, "manifest.json")
-    if not os.path.isfile(manifest_path):
+    try:
+        manifest_mode = os.lstat(manifest_path).st_mode
+    except FileNotFoundError:
         reasons.append("manifest.json missing")
+        return _verdict("INVALID", bundle_name, bundle_path, manifest_sha256, reasons)
+    if not stat.S_ISREG(manifest_mode):
+        reasons.append("manifest.json is not a regular file")
         return _verdict("INVALID", bundle_name, bundle_path, manifest_sha256, reasons)
 
     try:
@@ -87,28 +110,64 @@ def verify(bundle_path: str) -> Verdict:
     missing = MANIFEST_FIELDS - set(manifest)
     if missing:
         reasons.append(f"manifest missing fields: {sorted(missing)}")
-    if manifest.get("version") != MANIFEST_VERSION:
+    version = manifest.get("version")
+    if type(version) is not int or version != MANIFEST_VERSION:
+        reasons.append(f"unsupported manifest version: {version!r}")
+    declared = manifest.get("bundle")
+    if isinstance(declared, str):
+        bundle_name = declared
+    directory_name = os.path.basename(os.path.abspath(bundle_path))
+    if not isinstance(declared, str) or not NAME_RE.fullmatch(declared):
+        reasons.append(f"manifest bundle is not a valid bundle name: {declared!r}")
+    elif declared != directory_name:
         reasons.append(
-            "unsupported manifest version: {!r}".format(manifest.get("version"))
+            f"bundle directory {directory_name!r} is not the declared bundle "
+            f"name {declared!r}; only the published path validates"
         )
-    if isinstance(manifest.get("bundle"), str):
-        bundle_name = manifest["bundle"]
+    if not _is_timestamp(manifest.get("created")):
+        reasons.append(
+            "manifest created is not a timezone-aware ISO timestamp: {!r}".format(
+                manifest.get("created")
+            )
+        )
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
         reasons.append("manifest files map missing or empty")
         return _verdict("INVALID", bundle_name, bundle_path, manifest_sha256, reasons)
+    for rel in sorted(files):
+        entry = files[rel]
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != FILE_FIELDS
+            or not isinstance(entry["sha256"], str)
+            or not SHA256_RE.fullmatch(entry["sha256"])
+            or type(entry["size"]) is not int
+            or entry["size"] < 0
+        ):
+            reasons.append(f"malformed manifest entry: {rel}")
     if reasons:
         return _verdict("INVALID", bundle_name, bundle_path, manifest_sha256, reasons)
 
     listed = set(files)
     on_disk = set()
-    for root, dirs, fns in os.walk(bundle_path):
+    unreadable: list[OSError] = []
+    for root, dirs, fns in os.walk(bundle_path, onerror=unreadable.append):
         dirs.sort()
+        for dn in dirs:
+            if os.path.islink(os.path.join(root, dn)):
+                rel = os.path.relpath(os.path.join(root, dn), bundle_path)
+                reasons.append(f"unexpected symlink in bundle: {rel}")
         for fn in sorted(fns):
             rel = os.path.relpath(os.path.join(root, fn), bundle_path)
             if rel == "manifest.json":
                 continue
             on_disk.add(rel)
+
+    for error in unreadable:
+        rel = os.path.relpath(str(error.filename), bundle_path)
+        reasons.append(f"bundle directory unreadable: {rel}: {error.strerror}")
+    if unreadable:
+        return _verdict("INVALID", bundle_name, bundle_path, manifest_sha256, reasons)
 
     for rel in sorted(listed - on_disk):
         reasons.append(f"listed file absent: {rel}")
@@ -127,9 +186,9 @@ def verify(bundle_path: str) -> Verdict:
             for chunk in iter(lambda: f.read(65536), b""):
                 h.update(chunk)
                 size += len(chunk)
-        if not isinstance(entry, dict) or entry.get("sha256") != h.hexdigest():
+        if entry["sha256"] != h.hexdigest():
             reasons.append(f"hash mismatch: {rel}")
-        elif entry.get("size") != size:
+        elif entry["size"] != size:
             reasons.append(f"size mismatch: {rel}")
 
     return _verdict(
@@ -139,6 +198,15 @@ def verify(bundle_path: str) -> Verdict:
         manifest_sha256,
         reasons,
     )
+
+
+def _is_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.fromisoformat(value).tzinfo is not None
+    except ValueError:
+        return False
 
 
 def _verdict(
