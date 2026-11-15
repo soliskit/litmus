@@ -333,14 +333,23 @@ def pack(
     }
 
 
-def recover_sweep(out_parent: str) -> tuple[list[str], list[str]]:
+def recover_sweep(
+    out_parent: str, diagnostics: list[str] | None = None
+) -> tuple[list[str], list[str]]:
     """Best-effort removal of leftover staging dirs. Never a correctness
     condition; the consumer already rejects anything not at the exact
     published path with a complete manifest. Skips and reports staging a
     live pack still holds locked, symlinked entries, and anything it
     cannot remove. Reports reservations as skipped without opening or
-    deleting them. Returns (removed, skipped)."""
+    deleting them. Returns (removed, skipped). When diagnostics is given,
+    appends one escaped, single-line "name: reason" per skipped entry;
+    the returned tuple is unchanged."""
     import shutil
+
+    def note(fn: str, reason: str) -> None:
+        skipped.append(fn)
+        if diagnostics is not None:
+            diagnostics.append(f"skipped {json.dumps(fn)}: {reason}")
 
     if not os.path.isdir(out_parent):
         raise ValueError(f"output parent not found: {out_parent}")
@@ -348,39 +357,44 @@ def recover_sweep(out_parent: str) -> tuple[list[str], list[str]]:
     skipped: list[str] = []
     for fn in sorted(os.listdir(out_parent)):
         if fn.startswith(RESERVATION_PREFIX):
-            skipped.append(fn)  # Never open or delete reservations.
+            # Never open or delete reservations.
+            note(fn, "protected reservation, never swept")
             continue
         if not fn.startswith(STAGING_PREFIX):
             continue
         p = os.path.join(out_parent, fn)
         if os.path.islink(p) or not os.path.isdir(p):
-            skipped.append(fn)
+            note(fn, "symlink or not a directory; left in place")
             continue
         try:
             fd = os.open(p, os.O_RDONLY)
         except OSError:
-            skipped.append(fn)  # disappeared or could not be opened
+            # Disappeared or could not be opened.
+            note(fn, "could not be opened")
             continue
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                skipped.append(fn)  # a live pack holds the lock
+                # A live pack holds the lock.
+                note(fn, "locked by a live pack")
                 continue
             try:
                 st = os.stat(p)
                 fst = os.fstat(fd)
             except OSError:
-                skipped.append(fn)  # disappeared or could not be inspected
+                # Disappeared or could not be inspected.
+                note(fn, "could not be inspected")
                 continue
             if (st.st_dev, st.st_ino) != (fst.st_dev, fst.st_ino):
-                skipped.append(fn)
+                note(fn, "changed during inspection")
                 continue
             try:
                 shutil.rmtree(p)
                 removed.append(fn)
-            except OSError:
-                skipped.append(fn)
+            except OSError as exc:
+                # strerror only: no path is added to the diagnostic.
+                note(fn, f"removal failed ({exc.strerror}); files may remain")
         finally:
             os.close(fd)
     return removed, skipped
@@ -392,7 +406,10 @@ def main(argv: list[str]) -> int:
             print("usage: packager.py --recover-sweep OUT_PARENT", file=sys.stderr)
             return 2
         try:
-            removed, skipped = recover_sweep(argv[2])
+            diagnostics: list[str] = []
+            removed, skipped = recover_sweep(argv[2], diagnostics)
+            for line in diagnostics:
+                print(line, file=sys.stderr)
         except Exception as e:
             print(json.dumps({"error": str(e)}), file=sys.stderr)
             return 1
