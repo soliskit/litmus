@@ -231,3 +231,28 @@ class RecorderSkipRegressions(unittest.TestCase):
         self.assertEqual(ran, ["R1", "R3"])
         self.assertIn("FAIL R3 stub three: R3 stub failure", out.getvalue())
         self.assertIn("3 checks, 1 failures, 1 skipped", out.getvalue())
+
+
+class TrailingNewlineRegressions(unittest.TestCase):
+    """Issue 11: `$` must not let a trailing newline through validation."""
+
+    def test_bundle_name_with_trailing_newline_is_rejected(self) -> None:
+        self.assertTrue(packager.valid_bundle_name("nl"))
+        self.assertFalse(packager.valid_bundle_name("nl\n"))
+        with tempfile.TemporaryDirectory(prefix="litmus-regression-") as tmp:
+            root = Path(tmp)
+            evidence, output = root / "ev", root / "out"
+            evidence.mkdir()
+            output.mkdir()
+            (evidence / "a.txt").write_bytes(b"alpha\n")
+            with self.assertRaises(ValueError):
+                packager.pack(str(evidence), str(output), "nl\n")
+            self.assertEqual(list(output.iterdir()), [])
+
+    def test_commit_override_with_trailing_newline_is_rejected(self) -> None:
+        import recorder
+
+        good = "a" * 40
+        self.assertEqual(recorder.resolve_commit(".", good), (good, None))
+        with self.assertRaises(ValueError):
+            recorder.resolve_commit(".", good + "\n")
