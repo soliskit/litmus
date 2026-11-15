@@ -3,8 +3,10 @@
 Owner-side qualification tooling: an evidence-bundle packager and
 verifier, plus the gate that qualifies them.
 
-This repository holds a small set of manually run Python tools. It is not
-wired into CI and carries no application code.
+This repository holds a small set of Python tools and carries no
+application code. CI runs lint, formatting, type checks, staging
+regression tests, and packager and recorder checks on pull requests and
+pushes to main. The disk-heavy R10 check remains local.
 
 ## Contents
 
@@ -74,4 +76,4 @@ After any edit to the tool files, re-run the matching gate.
   signatures and do not prove authorship.
 - Receipts record single observed runs. They are not minimum-runtime
   proofs, not benchmarks, and do not replace CI.
-- Manual tooling, run by hand. Not CI-integrated.
+- The tools can be run by hand; CI also runs the checks listed above.
