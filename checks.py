@@ -210,7 +210,9 @@ def c1b(t: str) -> str:
     os.chmod(sp, 0o555)  # read-only: the copy gets a real OS write error
     resume(t, "bundle-c1b")
     out, err = proc.communicate(timeout=30)
-    os.chmod(sp, 0o755)
+    if os.path.exists(sp):
+        os.chmod(sp, 0o755)
+    assert not os.path.exists(sp), "failed pack left its removable own staging"
     assert proc.returncode == 1, (proc.returncode, out, err)
     assert "Permission denied" in err or "Errno 13" in err, (
         f"expected a real EACCES from the OS, got: {err}"
@@ -373,13 +375,15 @@ def c1f(t: str) -> str:
     linked = os.path.join(t, "linked", "bundle-c1f")
     os.symlink(bp, linked)
     cases.append(("symlinked-bundle", refused(linked, "bundle path is a symlink")))
-    # A real failed publish: a dangling symlink at the publish path leaves a
-    # complete staging directory behind.
+    # A real crash leaves complete unpublished staging despite normal cleanup.
     pub = os.path.join(t, "publish")
     os.makedirs(pub)
-    os.symlink("/nonexistent-target", os.path.join(pub, "bundle-c1f"))
-    r = run([PACKAGER, os.path.join(t, "evidence"), pub, "bundle-c1f"])
-    assert r.returncode == 1, r.stderr
+    shutil.copytree(os.path.join(t, "evidence"), os.path.join(pub, "evidence"))
+    proc = launch_paused(pub, "bundle-c1f", "after_manifest")
+    proc.kill()
+    proc.communicate(timeout=30)
+    assert proc.returncode == -signal.SIGKILL
+    assert not os.path.exists(os.path.join(pub, "bundle-c1f"))
     staging = [f for f in os.listdir(pub) if f.startswith(".staging-bundle-c1f-")]
     assert len(staging) == 1, staging
     sp = os.path.join(pub, staging[0])
@@ -413,7 +417,7 @@ def c1f(t: str) -> str:
         f"{len(cases)} cases all INVALID, each for its own reason: absent, "
         "missing, incomplete, hash mismatch, unknown framing, "
         f"{len(malformed)} malformed fields, a renamed copy, a symlinked "
-        "bundle path, complete staging from a failed publish, an extra "
+        "bundle path, complete staging from a real crash, an extra "
         "symlinked directory, a symlinked manifest and an unreadable directory"
     )
 

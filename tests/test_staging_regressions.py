@@ -15,8 +15,12 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import stat
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -246,16 +250,42 @@ class PublishedPathRegressions(unittest.TestCase):
         self.evidence.mkdir()
         (self.evidence / "a.txt").write_bytes(b"alpha\n")
 
-    def test_complete_staging_from_a_failed_publish_and_its_verdict_are_refused(
+    def test_complete_staging_from_a_crash_and_its_verdict_are_refused(
         self,
     ) -> None:
         import verifier
 
         output = self.root / "output"
         output.mkdir()
-        (output / "bundle-x").symlink_to("/nonexistent-target")
-        with self.assertRaises(FileExistsError):
-            packager.pack(str(self.evidence), str(output), "bundle-x")
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                packager.__file__,
+                str(self.evidence),
+                str(output),
+                "bundle-x",
+            ],
+            env=dict(os.environ, C1C2_PAUSE_AT="after_manifest"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            ready = output / ".sync-bundle-x-after_manifest.ready"
+            deadline = time.monotonic() + 30
+            while not ready.exists():
+                self.assertIsNone(
+                    proc.poll(), "producer exited before complete staging"
+                )
+                self.assertLess(time.monotonic(), deadline, "producer pause timed out")
+                time.sleep(0.02)
+            proc.kill()
+            proc.communicate(timeout=30)
+            self.assertEqual(proc.returncode, -signal.SIGKILL)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=30)
+        self.assertFalse((output / "bundle-x").exists())
         staging = [p for p in output.iterdir() if p.name.startswith(".staging-")]
         self.assertEqual(len(staging), 1)
         self.assertTrue((staging[0] / "manifest.json").is_file())
@@ -293,3 +323,359 @@ class PublishedPathRegressions(unittest.TestCase):
         self.assertEqual(
             verifier.check_verdict(published, str(verdict_path)), (True, [])
         )
+
+
+class OwnStagingRegressions(unittest.TestCase):
+    """Synthetic per-attempt faults; real crash/write-error witnesses stay separate."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="litmus-own-stage-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.evidence = self.root / "evidence"
+        self.output = self.root / "output"
+        self.evidence.mkdir()
+        self.output.mkdir()
+        (self.evidence / "payload").write_bytes(b"source")
+        self.original = OSError(errno.EIO, "original write failure")
+
+    def pack(self) -> dict[str, object]:
+        return packager.pack(str(self.evidence), str(self.output), "bundle")
+
+    def stage(self) -> Path:
+        paths = list(self.output.glob(".staging-*"))
+        self.assertEqual(len(paths), 1)
+        return paths[0]
+
+    def test_invalid_input_allocates_nothing(self) -> None:
+        (self.evidence / "manifest.json").write_text("reserved")
+        with patch.object(
+            packager, "_locked_staging", wraps=packager._locked_staging
+        ) as allocation:
+            with self.assertRaisesRegex(ValueError, "reserved name"):
+                self.pack()
+        allocation.assert_not_called()
+        self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_normal_failure_removes_only_own_stage_under_lock(self) -> None:
+        for name in (".staging-other", ".reserve-other", "unrelated"):
+            directory = self.output / name
+            directory.mkdir()
+            (directory / "payload").write_bytes(b"keep")
+        real_remove = __import__("shutil").rmtree
+        other_fd = os.open(self.output / ".staging-other", os.O_RDONLY)
+        self.addCleanup(os.close, other_fd)
+        fcntl.flock(other_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        witnessed: list[str] = []
+
+        def remove(path: str) -> None:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+            witnessed.append(path)
+            real_remove(path)
+
+        with (
+            patch.object(packager, "_write_sync", side_effect=self.original),
+            patch("shutil.rmtree", side_effect=remove),
+        ):
+            with self.assertRaises(OSError) as caught:
+                self.pack()
+        self.assertIs(caught.exception, self.original)
+        self.assertEqual(len(witnessed), 1)
+        for name in (".staging-other", ".reserve-other", "unrelated"):
+            self.assertEqual((self.output / name / "payload").read_bytes(), b"keep")
+        self.assertEqual((self.evidence / "payload").read_bytes(), b"source")
+        self.assertEqual(len(list(self.output.iterdir())), 3)
+
+    def test_partial_cleanup_failure_keeps_original_data_mode_and_reason(self) -> None:
+        errors = io.StringIO()
+        remaining: list[Path] = []
+
+        def write(path: str, data: bytes) -> None:
+            stage = Path(path).parent
+            (stage / "removed").write_bytes(b"partial")
+            (stage / "remaining").write_bytes(b"keep")
+            stage.chmod(0o700)
+            raise self.original
+
+        def partial(path: str) -> None:
+            stage = Path(path)
+            (stage / "removed").unlink()
+            remaining.append(stage)
+            raise PermissionError(errno.EACCES, "controlled removal obstacle")
+
+        with (
+            patch.object(packager, "_write_sync", side_effect=write),
+            patch("shutil.rmtree", side_effect=partial),
+            contextlib.redirect_stderr(errors),
+        ):
+            with self.assertRaises(OSError) as caught:
+                self.pack()
+        self.assertIs(caught.exception, self.original)
+        self.assertEqual((remaining[0] / "remaining").read_bytes(), b"keep")
+        self.assertFalse((remaining[0] / "removed").exists())
+        self.assertEqual(stat.S_IMODE(remaining[0].stat().st_mode), 0o700)
+        self.assertIn("files may remain", errors.getvalue())
+        self.assertIn("controlled removal obstacle", errors.getvalue())
+
+    def test_cleanup_diagnostic_and_close_errors_do_not_replace_original(self) -> None:
+        original_close = os.close
+
+        def close(fd: int) -> None:
+            original_close(fd)
+            raise OSError("controlled close failure")
+
+        def fail_write(path: str, data: bytes) -> None:
+            # Allocation is complete, so this fault affects only final lock close.
+            os.close = close
+            raise self.original
+
+        try:
+            with (
+                patch.object(packager, "_write_sync", side_effect=fail_write),
+                patch("shutil.rmtree", side_effect=OSError("cleanup failure")),
+                patch("builtins.print", side_effect=OSError("diagnostic failure")),
+            ):
+                with self.assertRaises(OSError) as caught:
+                    self.pack()
+            self.assertIs(caught.exception, self.original)
+        finally:
+            os.close = original_close
+
+    def test_identity_change_or_symlink_refuses_cleanup(self) -> None:
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                moved: list[Path] = []
+
+                def replace(
+                    path: str,
+                    data: bytes,
+                    symlink: bool = symlink,
+                    moved: list[Path] = moved,
+                ) -> None:
+                    stage = self.stage()
+                    saved = self.root / ("held-link" if symlink else "held-dir")
+                    stage.rename(saved)
+                    moved.append(saved)
+                    if symlink:
+                        stage.symlink_to(saved, target_is_directory=True)
+                    else:
+                        stage.mkdir()
+                        (stage / "replacement").write_bytes(b"keep")
+                    raise self.original
+
+                with (
+                    patch.object(packager, "_write_sync", side_effect=replace),
+                    patch("shutil.rmtree") as remove,
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    with self.assertRaises(OSError) as caught:
+                        self.pack()
+                self.assertIs(caught.exception, self.original)
+                remove.assert_not_called()
+                stage = self.stage()
+                if symlink:
+                    self.assertTrue(stage.is_symlink())
+                    stage.unlink()
+                else:
+                    self.assertEqual((stage / "replacement").read_bytes(), b"keep")
+                    (stage / "replacement").unlink()
+                    stage.rmdir()
+                moved[0].rmdir()
+
+    def test_interrupt_and_system_exit_do_not_attempt_removal(self) -> None:
+        for exception in (KeyboardInterrupt(), SystemExit(3)):
+            with self.subTest(exception=type(exception).__name__):
+                with (
+                    patch.object(packager, "_write_sync", side_effect=exception),
+                    patch("shutil.rmtree") as remove,
+                ):
+                    with self.assertRaises(type(exception)):
+                        self.pack()
+                remove.assert_not_called()
+                self.stage().rmdir()
+
+    def test_success_and_postpublish_close_error_never_remove_published(self) -> None:
+        self.pack()
+        self.assertEqual((self.output / "bundle" / "payload").read_bytes(), b"source")
+        original_close = os.close
+        original_rename = packager._rename_noreplace
+        changed = False
+
+        def close(fd: int) -> None:
+            original_close(fd)
+            raise OSError("postpublish close failure")
+
+        def rename(src: str, dst: str) -> None:
+            nonlocal changed
+            original_rename(src, dst)
+            os.close = close
+            changed = True
+
+        try:
+            with (
+                patch.object(packager, "_rename_noreplace", side_effect=rename),
+                patch("shutil.rmtree") as remove,
+            ):
+                with self.assertRaisesRegex(OSError, "postpublish close failure"):
+                    packager.pack(str(self.evidence), str(self.output), "bundle-two")
+            self.assertTrue(changed)
+            remove.assert_not_called()
+            self.assertEqual(
+                (self.output / "bundle-two" / "payload").read_bytes(), b"source"
+            )
+        finally:
+            os.close = original_close
+
+    def test_inspection_refusal_and_allocation_failure_do_not_remove(self) -> None:
+        with (
+            patch.object(
+                packager, "_locked_staging", side_effect=OSError("allocation failure")
+            ),
+            patch("shutil.rmtree") as remove,
+        ):
+            with self.assertRaisesRegex(OSError, "allocation failure"):
+                self.pack()
+        remove.assert_not_called()
+        original_fstat = os.fstat
+
+        def write(path: str, data: bytes) -> None:
+            os.fstat = lambda fd: (_ for _ in ()).throw(OSError("inspection failure"))
+            raise self.original
+
+        try:
+            with (
+                patch.object(packager, "_write_sync", side_effect=write),
+                patch("shutil.rmtree") as remove,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                with self.assertRaises(OSError) as caught:
+                    self.pack()
+            self.assertIs(caught.exception, self.original)
+            remove.assert_not_called()
+            self.assertTrue(self.stage().is_dir())
+        finally:
+            os.fstat = original_fstat
+
+    def test_postpublish_fsync_warning_and_manual_result_unchanged(self) -> None:
+        original = packager._fsync_dir
+
+        def fsync(path: str) -> None:
+            if path == str(self.output):
+                raise OSError("postpublish fsync failure")
+            original(path)
+
+        with (
+            patch.object(packager, "_fsync_dir", side_effect=fsync),
+            patch("shutil.rmtree") as remove,
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            result = self.pack()
+        remove.assert_not_called()
+        self.assertEqual(result["bundle"], "bundle")
+        self.assertEqual((self.output / "bundle" / "payload").read_bytes(), b"source")
+        self.assertIn("post-publish fsync failed", errors.getvalue())
+        (self.output / ".staging-residue").mkdir()
+        (self.output / ".reserve-protected").mkdir()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = packager.main(["packager.py", "--recover-sweep", str(self.output)])
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "recovered_staging": [".staging-residue"],
+                "skipped_staging": [".reserve-protected"],
+            },
+        )
+        self.assertIn("protected reservation", stderr.getvalue())
+
+    def test_unprintable_cleanup_and_close_errors_keep_original(self) -> None:
+        class UnprintableError(Exception):
+            def __str__(self) -> str:
+                raise RuntimeError("controlled formatting failure")
+
+        original_close = os.close
+
+        def close(fd: int) -> None:
+            original_close(fd)
+            raise UnprintableError()
+
+        def write(path: str, data: bytes) -> None:
+            os.close = close
+            raise self.original
+
+        try:
+            with (
+                patch.object(packager, "_write_sync", side_effect=write),
+                patch("shutil.rmtree", side_effect=UnprintableError()),
+            ):
+                with self.assertRaises(OSError) as caught:
+                    self.pack()
+            self.assertIs(caught.exception, self.original)
+        finally:
+            os.close = original_close
+
+    def test_callers_active_exception_does_not_hide_postpublish_close_error(
+        self,
+    ) -> None:
+        original_close = os.close
+        original_rename = packager._rename_noreplace
+
+        def close(fd: int) -> None:
+            original_close(fd)
+            raise OSError("postpublish close failure")
+
+        def rename(src: str, dst: str) -> None:
+            original_rename(src, dst)
+            os.close = close
+
+        try:
+            try:
+                raise ValueError("caller's handled exception")
+            except ValueError:
+                with (
+                    patch.object(packager, "_rename_noreplace", side_effect=rename),
+                    patch("shutil.rmtree") as remove,
+                ):
+                    with self.assertRaisesRegex(OSError, "postpublish close failure"):
+                        self.pack()
+                remove.assert_not_called()
+                self.assertEqual(
+                    (self.output / "bundle" / "payload").read_bytes(), b"source"
+                )
+        finally:
+            os.close = original_close
+
+    def test_interrupts_win_over_secondary_close_error_without_cleanup(self) -> None:
+        original_close = os.close
+
+        def close(fd: int) -> None:
+            original_close(fd)
+            raise OSError("secondary close failure")
+
+        for exception in (KeyboardInterrupt(), SystemExit(3)):
+
+            def write(
+                path: str, data: bytes, exception: BaseException = exception
+            ) -> None:
+                os.close = close
+                raise exception
+
+            try:
+                with (
+                    patch.object(packager, "_write_sync", side_effect=write),
+                    patch("shutil.rmtree") as remove,
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    with self.assertRaises(type(exception)) as caught:
+                        self.pack()
+                self.assertIs(caught.exception, exception)
+                remove.assert_not_called()
+                self.stage().rmdir()
+            finally:
+                os.close = original_close
