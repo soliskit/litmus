@@ -124,6 +124,13 @@ CHECK DEFINITIONS (what the gate's 16 checks verify)
 - C3-c: a sweep on a missing OUT_PARENT refuses cleanly.
 
 QUALIFICATION RUNS
+November 14, 2026: the 16-check gate passed 16 of 16 on the current
+sources via bare `python3 checks.py` startup from the repository root,
+using CPython 3.10.12 on unprivileged Linux x86-64. The same run
+passed ruff check, ruff format --check (13 files), mypy (6 source
+files) and the 10 staging-regression unit tests. These sources are the
+fourteen-issue batch merged through pull requests #23 to #31.
+
 November 12, 2026: the 16-check gate passed 16 of 16 on the current
 sources via bare `python3 checks.py` startup from the repository root
 and from a foreign working directory, using CPython 3.10.12 on
