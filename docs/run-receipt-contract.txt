@@ -99,8 +99,8 @@ CHECK DEFINITIONS (what the gate's 10 checks verify)
   --commit is refused.
 - R6: a dirty worktree is recorded as worktree_clean false, not hidden.
 - R7: the receipt carries exactly the schema's fields, the UTC
-  timestamps parse and order, and the printed receipt equals the
-  published file.
+  timestamps parse (their order is not checked: they are wall clock),
+  and the printed receipt equals the published file.
 - R8: the published log is frozen: a background descendant's later
   output never changes it, and the receipt hash still matches.
 - R9: under a firing timeout with a setsid-escaped writer, the
