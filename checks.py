@@ -248,11 +248,13 @@ def c1c(t: str) -> str:
 @check("C1-d path abuse names rejected before staging")
 def c1d(t: str) -> str:
     make_evidence(t)
-    for bad in [".", "..", "", "a/b", ".staging-x", " ", "../x"]:
+    bad_names = [".", "..", "", "a/b", ".staging-x", " ", "../x", "nl\n"]
+    for bad in bad_names:
         r = run([PACKAGER, os.path.join(t, "evidence"), t, bad])
         assert r.returncode == 1, repr(bad)
     assert not [f for f in os.listdir(t) if f.startswith(".staging-")]
-    return "7 abusive names rejected, no staging created"
+    assert not os.path.exists(os.path.join(t, "nl\n")), "newline name published"
+    return f"{len(bad_names)} abusive names rejected, no staging created"
 
 
 @check("C1-e cross-filesystem staging rejected on a real second filesystem")

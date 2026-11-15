@@ -389,22 +389,30 @@ def r5(t: str) -> str:
     receipt, _ = read_receipt(rp)
     assert receipt["commit"] == commit
     assert receipt["worktree_clean"] is None
-    r = run(
-        [
-            RECORDER,
-            os.path.join(t, "bad.json"),
-            "--cwd",
-            t,
-            "--commit",
-            "nothex",
-            "--",
-            sys.executable,
-            "-c",
-            "pass",
-        ]
+    marker = os.path.join(t, "should-not-exist")
+    for bad in ("nothex", commit + "\n"):
+        rp_bad = os.path.join(t, "bad.json")
+        r = run(
+            [
+                RECORDER,
+                rp_bad,
+                "--cwd",
+                t,
+                "--commit",
+                bad,
+                "--",
+                sys.executable,
+                "-c",
+                f"open({marker!r},'w').write('x')",
+            ]
+        )
+        assert r.returncode == 1, (bad, r.returncode)
+        assert not os.path.exists(rp_bad), f"receipt written for commit {bad!r}"
+        assert not os.path.exists(marker), f"command ran with commit {bad!r}"
+    return (
+        "no HEAD and no --commit: no receipt; override recorded; malformed "
+        "commits, including 40 hex plus a newline, refused before launch"
     )
-    assert r.returncode == 1
-    return "no HEAD and no --commit: no receipt; override recorded"
 
 
 @check("R6 dirty worktree is recorded, not hidden")
