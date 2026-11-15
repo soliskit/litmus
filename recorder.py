@@ -15,7 +15,9 @@ Honesty boundaries:
   clock changes. started/ended are wall-clock UTC and are NOT monotonic.
 - commit is the worktree's HEAD at launch. A dirty worktree means the
   bytes that ran are not the commit's bytes; worktree_clean records that
-  state honestly instead of hiding it.
+  state honestly instead of hiding it. Both come from the working
+  directory's own repository: GIT_* environment variables and git config
+  that hide files from git status do not change them.
 - cwd and argv are recorded raw, including local absolute paths.
   Normalizing machine-specific paths is a separate publication step,
   never the recorder's edit.
@@ -126,21 +128,34 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _git(cwd: str, *args: str) -> "subprocess.CompletedProcess[str]":
+    """Run git on cwd's own repository and work tree. GIT_* variables such
+    as GIT_DIR or GIT_WORK_TREE would point git at other state, so none
+    reaches it, and the fsmonitor that could vouch for files is off."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    return subprocess.run(
+        ["git", "-c", "core.fsmonitor=false", "-C", cwd, *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+
+
 def resolve_commit(cwd: str, commit_override: str | None) -> tuple[str, bool | None]:
     """Return (commit, worktree_clean). Fail closed: without a resolvable
     HEAD and no override there is no receipt, because the commit field is
-    load-bearing for everything the receipt says about what ran."""
+    load-bearing for everything the receipt says about what ran.
+    worktree_clean is true only when git status, with untracked files and
+    submodules always included, reports nothing and no index entry is
+    marked assume-unchanged or skip-worktree: git status does not look at
+    those files, so nothing vouches for them."""
     if commit_override is not None:
         if not COMMIT_RE.match(commit_override):
             raise ValueError("--commit must be 40 lowercase hex characters")
         return commit_override, None
     try:
-        head = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        head = _git(cwd, "rev-parse", "HEAD")
     except FileNotFoundError:
         raise ValueError("git not found; pass --commit") from None
     if head.returncode != 0:
@@ -148,15 +163,28 @@ def resolve_commit(cwd: str, commit_override: str | None) -> tuple[str, bool | N
     commit = head.stdout.strip()
     if not COMMIT_RE.match(commit):
         raise ValueError(f"unexpected git HEAD output: {commit!r}")
-    status = subprocess.run(
-        ["git", "-C", cwd, "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-        timeout=30,
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    toplevel = os.path.realpath(top.stdout.rstrip("\n"))
+    if (
+        top.returncode != 0
+        or os.path.commonpath([toplevel, os.path.realpath(cwd)]) != toplevel
+    ):
+        raise ValueError(f"git work tree does not contain {cwd}; pass --commit")
+    status = _git(
+        cwd,
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
     )
     if status.returncode != 0:
         raise ValueError(f"git status failed in {cwd}")
-    return commit, status.stdout == ""
+    entries = _git(cwd, "ls-files", "-v", "-z")
+    if entries.returncode != 0:
+        raise ValueError(f"git ls-files failed in {cwd}")
+    # ls-files -v tags assume-unchanged entries in lower case, skip-worktree S.
+    hidden = any(e[0].islower() or e[0] == "S" for e in entries.stdout.split("\0") if e)
+    return commit, status.stdout == "" and not hidden
 
 
 def record(

@@ -426,7 +426,66 @@ def r6(t: str) -> str:
     receipt, _ = read_receipt(rp)
     assert receipt["worktree_clean"] is False
     assert receipt["commit"] == git(repo, "rev-parse", "HEAD")
-    return "worktree_clean false with uncommitted changes"
+
+    def recorded(name: str, cwd: str, **env: str) -> "recorder.Receipt":
+        path = os.path.join(t, name)
+        r = subprocess.run(
+            [sys.executable, RECORDER, path, "--cwd", cwd, "--", "true"],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, **env),
+        )
+        assert r.returncode == 0, (name, r.stderr)
+        receipt, _ = read_receipt(path)
+        return receipt
+
+    # git config and index flags that hide changes from git status
+    hidden: list[tuple[str, Callable[[str], object]]] = [
+        (
+            "assume-unchanged",
+            lambda d: git(d, "update-index", "--assume-unchanged", "tracked.txt"),
+        ),
+        (
+            "skip-worktree",
+            lambda d: git(d, "update-index", "--skip-worktree", "tracked.txt"),
+        ),
+    ]
+    for label, flag in hidden:
+        d = make_repo(os.path.join(t, label))
+        with open(os.path.join(d, "tracked.txt"), "a") as f:
+            f.write("dirty\n")
+        flag(d)
+        assert git(d, "status", "--porcelain") == "", f"{label} did not hide the edit"
+        assert recorded(f"{label}.json", d)["worktree_clean"] is False, label
+    d = make_repo(os.path.join(t, "untracked"))
+    git(d, "config", "status.showUntrackedFiles", "no")
+    with open(os.path.join(d, "untracked.txt"), "w") as f:
+        f.write("untracked\n")
+    assert git(d, "status", "--porcelain") == "", "config did not hide the file"
+    assert recorded("untracked.json", d)["worktree_clean"] is False
+
+    # GIT_DIR naming another repository changes neither field
+    clean = make_repo(os.path.join(t, "clean"))
+    other = make_repo(os.path.join(t, "other"))
+    git(other, "commit", "-q", "--allow-empty", "-m", "other")
+    receipt = recorded("git-dir.json", clean, GIT_DIR=os.path.join(other, ".git"))
+    assert receipt["commit"] == git(clean, "rev-parse", "HEAD"), "GIT_DIR followed"
+    assert receipt["commit"] != git(other, "rev-parse", "HEAD")
+    assert receipt["worktree_clean"] is True, "GIT_DIR changed worktree_clean"
+
+    # A repository whose config moves its work tree elsewhere is refused
+    moved = make_repo(os.path.join(t, "moved"))
+    git(moved, "config", "core.worktree", other)
+    path = os.path.join(t, "moved.json")
+    r = run([RECORDER, path, "--cwd", moved, "--", sys.executable, "-c", "pass"])
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    assert not os.path.exists(path), "receipt written for a moved work tree"
+    return (
+        "worktree_clean false for a plain edit, an edit behind assume-unchanged "
+        "or skip-worktree, and an untracked file behind "
+        "status.showUntrackedFiles=no; GIT_DIR changed neither field; a "
+        "work tree moved by core.worktree refused"
+    )
 
 
 @check("R7 receipt framing is exact and timestamps parse")

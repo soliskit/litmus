@@ -17,9 +17,16 @@ RECEIPT FIELDS (version 1; the exact set, no more and no fewer)
 - version: receipt schema version, 1.
 - commit: the 40-hex HEAD of the working directory at launch, or the
   --commit override. Load-bearing: without it there is no receipt.
-- worktree_clean: true or false from git status at launch; null when
-  the commit came from --commit, where the recorder establishes
-  nothing about the worktree.
+  GIT_* environment variables do not redirect it, and a repository
+  whose work tree does not contain the working directory (as with
+  core.worktree) refuses the run.
+- worktree_clean: true or false from git status at launch, with
+  untracked files and submodules always included whatever git config
+  says; false also when any index entry is marked assume-unchanged or
+  skip-worktree, since git status does not look at those files (a
+  sparse checkout therefore records false); null when the commit came
+  from --commit, where the recorder establishes nothing about the
+  worktree.
 - argv: the exact argument vector that ran, element for element.
 - cwd: the absolute working directory the command ran in. Recorded raw.
 - started, ended: wall-clock UTC ISO timestamps of the run. NOT
@@ -113,7 +120,11 @@ CHECK DEFINITIONS (what the gate's 10 checks verify)
 - R5: outside a git work tree with no --commit there is no receipt; a
   --commit override is recorded with worktree_clean null; a malformed
   --commit is refused.
-- R6: a dirty worktree is recorded as worktree_clean false, not hidden.
+- R6: a dirty worktree is recorded as worktree_clean false, not hidden,
+  including an edit behind assume-unchanged or skip-worktree and an
+  untracked file behind status.showUntrackedFiles=no; a GIT_DIR naming
+  another repository changes neither commit nor worktree_clean, and a
+  work tree moved by core.worktree is refused.
 - R7: the receipt carries exactly the schema's fields, the UTC
   timestamps parse and order, and the printed receipt equals the
   published file.
