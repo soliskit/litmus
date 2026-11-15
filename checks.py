@@ -320,7 +320,10 @@ def c1f(t: str) -> str:
     return "5 classes all INVALID"
 
 
-@check("C1-g stale/foreign verdict rejected against current bytes and identity")
+@check(
+    "C1-g stale/foreign/moved/repacked verdict rejected against current bytes"
+    " and identity"
+)
 def c1g(t: str) -> str:
     import verifier
 
@@ -333,6 +336,29 @@ def c1g(t: str) -> str:
     open(vp, "w").write(good.stdout)
     ok, reasons = verifier.check_verdict(bp, vp)
     assert ok, reasons  # fresh verdict for unchanged bundle is accepted
+
+    def decided_by(field: str, path: str) -> None:
+        # The bundle validates and every other bound field matches, so only
+        # this field's binding can reject the stored verdict.
+        assert verifier.verify(path)["verdict"] == "VALID"
+        ok, reasons = verifier.check_verdict(path, vp)
+        assert not ok, f"verdict accepted with only {field} differing"
+        assert len(reasons) == 1 and reasons[0].startswith(f"{field} mismatch"), reasons
+
+    # moved: the unchanged bundle, same name, another directory
+    moved = os.path.join(t, "elsewhere", "bundle-c1g")
+    os.makedirs(os.path.dirname(moved))
+    os.rename(bp, moved)
+    decided_by("bundle_path", moved)
+    os.rename(moved, bp)
+    # changed: a same-name repack at the same path with different evidence
+    shutil.rmtree(bp)
+    changed = make_evidence(os.path.join(t, "changed"))
+    with open(os.path.join(changed, "added.log"), "w") as f:
+        f.write("evidence the verdict never saw\n")
+    r = run([PACKAGER, changed, t, "bundle-c1g"])
+    assert r.returncode == 0, r.stderr
+    decided_by("manifest_sha256", bp)
     # evidence changed while the manifest is untouched: hash mismatch AND
     # the stored verdict is now stale
     with open(os.path.join(bp, "evidence-2.log"), "a") as f:
@@ -347,8 +373,10 @@ def c1g(t: str) -> str:
     ok, reasons = verifier.check_verdict(bp2, vp)
     assert not ok, "foreign verdict accepted for a different bundle"
     return (
-        "fresh verdict accepted; stale (changed evidence) and foreign "
-        "(different bundle) verdicts rejected"
+        "fresh verdict accepted; a moved bundle rejected by the path binding "
+        "alone and a same-name repack by the manifest-hash binding alone; "
+        "stale (changed evidence) and foreign (different bundle) verdicts "
+        "rejected"
     )
 
 
