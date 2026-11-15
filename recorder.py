@@ -29,6 +29,10 @@ Honesty boundaries:
   exit and signal record how the run actually ended, because a natural
   exit can race the kill. It does not record where the run was when
   the deadline fired.
+- SIGINT, SIGTERM or SIGHUP to the recorder while the run is live sends
+  the same real SIGKILL to the run's whole process group; no receipt is
+  published and the recorder exits 128 plus the signal number. A missing
+  receipt never hides a live run.
 
 No root, no mounts, no environment mechanics. Python 3 standard library
 only. git is used only to read HEAD and worktree state.
@@ -36,6 +40,7 @@ only. git is used only to read HEAD and worktree state.
 
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -65,6 +70,26 @@ RECEIPT_FIELDS = {
 OUTPUT_FIELDS = {"path", "sha256", "bytes"}
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 LOG_SUFFIX = ".log"
+INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+class Interrupted(Exception):
+    """SIGINT, SIGTERM or SIGHUP reached the recorder."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"interrupted by signal {signum}")
+        self.signum = signum
+
+
+def _raise_interrupted(signum: int, _frame: object) -> None:
+    raise Interrupted(signum)
+
+
+def _kill_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 class ReceiptOutput(TypedDict):
@@ -166,18 +191,36 @@ def record(
     t0 = time.monotonic()
     timed_out = False
     with open(staged_log, "xb") as logf:
-        proc = subprocess.Popen(
-            argv, cwd=cwd, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True
-        )
+        # Interrupts stay pending while the run starts, so none can land
+        # between its start and the handling below. The command itself
+        # starts with the recorder's original signal mask.
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, INTERRUPT_SIGNALS)
         try:
-            rc = proc.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+            proc = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, mask),
+            )
+        except BaseException:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            raise
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            rc = proc.wait()
+                rc = proc.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_group(proc.pid)
+                rc = proc.wait()
+        except BaseException:
+            # Interrupted while the run is live: kill its whole group, so
+            # no run outlives the recorder without its deadline.
+            _kill_group(proc.pid)
+            proc.wait()
+            raise
     ended = _utcnow()
     runtime = time.monotonic() - t0
 
@@ -223,7 +266,8 @@ def record(
         "signal": sig,
         "output": output,
     }
-    data = json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n"
+    data = json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False).encode()
+    data += b"\n"
     with open(staged_receipt, "xb") as f:
         f.write(data)
         f.flush()
@@ -276,8 +320,8 @@ def main(argv: list[str]) -> int:
             except ValueError:
                 print("--timeout must be a number of seconds", file=sys.stderr)
                 return 2
-            if timeout_seconds <= 0:
-                print("--timeout must be positive", file=sys.stderr)
+            if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+                print("--timeout must be a finite positive number", file=sys.stderr)
                 return 2
             i += 2
         elif o == "--cwd" and i + 1 < len(opts):
@@ -295,8 +339,14 @@ def main(argv: list[str]) -> int:
     if receipt_path is None:
         print(USAGE, file=sys.stderr)
         return 2
+    for signum in INTERRUPT_SIGNALS:
+        signal.signal(signum, _raise_interrupted)
     try:
         receipt = record(receipt_path, command, cwd, timeout_seconds, commit_override)
+    except Interrupted as e:
+        error = f"{e}; any live run's process group was killed; no receipt"
+        print(json.dumps({"error": error}), file=sys.stderr)
+        return 128 + e.signum
     except Exception as e:
         print(json.dumps({"error": str(e)}), file=sys.stderr)
         return 1

@@ -26,7 +26,10 @@ RECEIPT FIELDS (version 1; the exact set, no more and no fewer)
   monotonic.
 - runtime_seconds: the measured duration on a monotonic clock, rounded
   to milliseconds.
-- timeout_seconds: the --timeout value, or null when none was set.
+- timeout_seconds: the --timeout value, or null when none was set. Only
+  a finite positive number is accepted; nan, inf and values of zero or
+  less are refused before the command starts. Every receipt is strict
+  JSON, never holding NaN or Infinity.
 - timed_out: true exactly when the timeout fired.
 - exit: the process exit code, or null when the run ended by a signal.
 - signal: the signal number that ended the run, or null. A timeout
@@ -57,6 +60,11 @@ GUARANTEES
   true.
 - Exit propagation. Otherwise the recorder exits with the run's own
   code, or 128 plus the signal number when a signal ended the run.
+- Interrupt. SIGINT, SIGTERM or SIGHUP sent to the recorder while the
+  run is live sends a real SIGKILL to the run's whole process group;
+  no receipt is published and the recorder exits 128 plus the signal
+  number. A missing receipt never hides a live run. An interrupt after
+  the run ended can leave a log without its receipt.
 
 NON-CLAIMS
 - A receipt records ONE OBSERVED run. It is not a minimum-runtime
@@ -90,8 +98,12 @@ CHECK DEFINITIONS (what the gate's 10 checks verify)
   and the output hash and bytes match the published log.
 - R2: a failing exit code is recorded and propagated.
 - R3: a real timeout kills the run's process group with a real
-  SIGKILL; the child is really dead, the receipt records timed_out, a
-  null exit and signal 9, and the recorder exits 124.
+  SIGKILL; the child and a background descendant in its group are
+  really dead, the receipt records timed_out, a null exit and signal 9,
+  and the recorder exits 124. SIGINT, SIGTERM and SIGHUP to the
+  recorder during a run kill the same group, publish no receipt and
+  exit 128 plus the signal number. --timeout nan, inf, -inf, 0 and -1
+  are refused before the command starts.
 - R4: an existing receipt or an existing output log refuses the run
   before the command starts; the existing bytes are untouched.
 - R5: outside a git work tree with no --commit there is no receipt; a
