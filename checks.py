@@ -273,11 +273,13 @@ def c1e(t: str) -> str:
         f for f in os.listdir(SECOND_FS) if f.startswith(".staging-bundle-c1e-")
     ]
     for f in leftover:
-        shutil.rmtree(os.path.join(SECOND_FS, f), ignore_errors=True)
+        sp = os.path.join(SECOND_FS, f)
+        assert os.listdir(sp) == [], f"evidence written to wrong-device staging {f}"
+        os.rmdir(sp)
     return (
-        f"real cross-device attempt ({SECOND_FS} vs /tmp) rejected before any "
-        "evidence CONTENT write; the empty staging dir on the wrong "
-        "device was created, refused, and removed"
+        f"real cross-device attempt (staging on {SECOND_FS}, publish target "
+        f"{t}) rejected; the {len(leftover)} staging dir(s) the refusal left "
+        "on the wrong device held no evidence, and the gate removed them"
     )
 
 
@@ -352,15 +354,52 @@ def c1g(t: str) -> str:
     )
 
 
-@check("C1-h evidence file named manifest.json rejected (input collision)")
+@check(
+    "C1-h evidence input refused: file named manifest.json (input collision),"
+    " symlinked or unreadable directory"
+)
 def c1h(t: str) -> str:
-    ed = make_evidence(t)
-    with open(os.path.join(ed, "manifest.json"), "w") as f:
+    reserved = make_evidence(os.path.join(t, "reserved"))
+    with open(os.path.join(reserved, "manifest.json"), "w") as f:
         f.write('{"verdict": "VALID"}\n')
-    r = run([PACKAGER, ed, t, "bundle-c1h"])
-    assert r.returncode == 1
-    assert not os.path.exists(os.path.join(t, "bundle-c1h"))
-    return "reserved-name input refused before staging"
+    linked = make_evidence(os.path.join(t, "linked"))
+    real = os.path.join(t, "linked-target")
+    os.makedirs(real)
+    with open(os.path.join(real, "x.txt"), "w") as f:
+        f.write("behind a symlinked directory\n")
+    os.symlink(real, os.path.join(linked, "linkdir"))
+    locked = make_evidence(os.path.join(t, "locked"))
+    hidden = os.path.join(locked, "hidden")
+    os.makedirs(hidden)
+    with open(os.path.join(hidden, "y.txt"), "w") as f:
+        f.write("behind an unreadable directory\n")
+    os.chmod(hidden, 0)
+    legs = [
+        ("reserved", reserved, "collides with reserved name: manifest.json"),
+        ("symlinked", linked, "symlinked evidence directory refused: linkdir"),
+        ("unreadable", locked, "evidence directory unreadable: hidden"),
+    ]
+    staged = 0
+    try:
+        if os.access(hidden, os.R_OK):
+            raise AssertionError("account bypasses mode 000; run unprivileged")
+        for label, evidence, expected in legs:
+            name = f"bundle-c1h-{label}"
+            r = run([PACKAGER, evidence, t, name])
+            assert r.returncode == 1, (label, r.returncode, r.stdout)
+            assert expected in r.stderr, (label, r.stderr)
+            assert not os.path.exists(os.path.join(t, name)), label
+            residue = [e for e in os.listdir(t) if e.startswith(f".staging-{name}-")]
+            for e in residue:
+                assert os.listdir(os.path.join(t, e)) == [], (label, "evidence copied")
+            staged += len(residue)
+    finally:
+        os.chmod(hidden, 0o700)
+    return (
+        "reserved-name, symlinked-directory and unreadable-directory inputs "
+        "refused with exit 1 and a named error, nothing published; the "
+        f"{staged} staging dir(s) the refusals left hold no evidence"
+    )
 
 
 @check("C2-a fixture legs carry evidence fields only; no verdict field exists")
