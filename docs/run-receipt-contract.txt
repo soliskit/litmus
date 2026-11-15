@@ -138,6 +138,14 @@ CHECK DEFINITIONS (what the gate's 10 checks verify)
   snapshot whose hash matches the published log.
 
 QUALIFICATION RUNS
+November 14, 2026: the 10-check gate passed 10 of 10 on the current
+sources via bare `python3 recorder-checks.py` startup, using CPython
+3.10.12 on unprivileged Linux x86-64. R10 ran locally under its
+bounded controls and terminated in 6.1 s with a bounded
+3,665,821,696-byte snapshot whose hash matches. CI still runs R1-R9
+with RECORDER_CHECKS_SKIP=R10; this local run does not change that
+coverage.
+
 November 12, 2026: the 10-check gate passed 10 of 10 on the current
 sources via bare `python3 recorder-checks.py` startup, using CPython
 3.10.12 on unprivileged Linux x86-64.
