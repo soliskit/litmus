@@ -21,9 +21,10 @@ Honesty boundaries:
   never the recorder's edit.
 - The receipt path is never overwritten: publication is two atomic
   no-overwrite hard links, the output log first and then the receipt,
-  and an existing receipt or output log refuses the run before the
-  command starts. A log without its receipt can exist after an
-  interruption; such a log is not a receipt and carries no meaning.
+  and an existing receipt or output log, including a symlink whose
+  target is missing, refuses the run before the command starts. A log
+  without its receipt can exist after an interruption; such a log is
+  not a receipt and carries no meaning.
 - A firing timeout sends a real SIGKILL to the run's whole process
   group. The receipt records timed_out, meaning the deadline fired;
   exit and signal record how the run actually ended, because a natural
@@ -150,9 +151,11 @@ def record(
         raise ValueError(f"receipt parent directory not found: {parent}")
     if not receipt_name:
         raise ValueError("receipt path names no file")
-    if os.path.exists(receipt_path):
+    # lexists: a symlink whose target is missing also takes the name, and
+    # the no-overwrite link would refuse it only after the command ran.
+    if os.path.lexists(receipt_path):
         raise ValueError(f"receipt path already exists: {receipt_path}")
-    if os.path.exists(os.path.join(parent, log_name)):
+    if os.path.lexists(os.path.join(parent, log_name)):
         raise ValueError(f"output log path already exists: {log_name}")
     if not os.path.isdir(cwd):
         raise ValueError(f"working directory not found: {cwd}")

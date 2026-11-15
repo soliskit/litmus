@@ -39,10 +39,13 @@ GUARANTEES
 - Exact argv record. The vector that ran is the vector recorded.
 - Monotonic runtime. runtime_seconds is measured on a monotonic clock,
   independent of wall-clock changes.
-- No overwrite. An existing receipt path or output log path refuses
-  the run BEFORE the command starts. Publication is two atomic
-  no-overwrite hard links, log first then receipt; after the receipt
-  link the pair is complete.
+- No overwrite. An existing receipt path or output log path, including
+  a symlink whose target is missing, refuses the run BEFORE the command
+  starts. Publication is two atomic no-overwrite hard links, log first
+  then receipt; after the receipt link the pair is complete. Two runs
+  started together on one receipt path can both pass that check and
+  both run; the later publication is then refused at its link, and
+  nothing is overwritten.
 - Frozen log. The published log is a frozen copy of the run's captured
   output: it holds what the run had written when the recorder froze
   it, shortly after the direct child exited (after a firing timeout,
@@ -93,7 +96,8 @@ CHECK DEFINITIONS (what the gate's 10 checks verify)
   SIGKILL; the child is really dead, the receipt records timed_out, a
   null exit and signal 9, and the recorder exits 124.
 - R4: an existing receipt or an existing output log refuses the run
-  before the command starts; the existing bytes are untouched.
+  before the command starts; the existing bytes are untouched. A
+  dangling symlink at either path refuses it too, and stays as it was.
 - R5: outside a git work tree with no --commit there is no receipt; a
   --commit override is recorded with worktree_clean null; a malformed
   --commit is refused.
