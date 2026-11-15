@@ -233,10 +233,20 @@ def valid_bundle_name(name: str) -> bool:
 def collect_evidence(evidence_dir: str) -> dict[str, str]:
     """Return {relpath: abspath} for regular files only; refuse the rest,
     including any input named manifest.json (reserved for the bundle's own
-    manifest)."""
+    manifest). A symlinked directory and a directory that cannot be read
+    are refused too, so nothing under evidence_dir is skipped silently."""
     entries: dict[str, str] = {}
-    for root, dirs, files in os.walk(evidence_dir):
+
+    def refuse_unreadable(error: OSError) -> None:
+        rel = os.path.relpath(str(error.filename), evidence_dir)
+        raise ValueError(f"evidence directory unreadable: {rel}: {error.strerror}")
+
+    for root, dirs, files in os.walk(evidence_dir, onerror=refuse_unreadable):
         dirs.sort()
+        for dn in dirs:
+            if os.path.islink(os.path.join(root, dn)):
+                rel = os.path.relpath(os.path.join(root, dn), evidence_dir)
+                raise ValueError(f"symlinked evidence directory refused: {rel}")
         for fn in sorted(files):
             ap = os.path.join(root, fn)
             rel = os.path.relpath(ap, evidence_dir)

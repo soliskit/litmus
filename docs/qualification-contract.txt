@@ -60,7 +60,10 @@ GUARANTEES
   invalid. Stale verdicts (changed evidence)
   and foreign verdicts (different bundle) are rejected against the
   current bytes and identity. An evidence file named manifest.json is
-  refused as input (reserved-name collision). Abusive bundle names are
+  refused as input (reserved-name collision). So is evidence that cannot
+  be packed whole: a symlinked file or directory, any other non-regular
+  entry, or a directory that cannot be read; nothing under the evidence
+  directory is skipped. Abusive bundle names are
   rejected before any staging is created. Staging on a different
   filesystem than the publish target is rejected before any evidence
   content is written.
@@ -109,7 +112,9 @@ CHECK DEFINITIONS (what the gate's 16 checks verify)
   and an unreadable directory; each case is decided by its own reason.
 - C1-g: stale and foreign verdicts are rejected against current bytes
   and identity; a fresh verdict is accepted.
-- C1-h: an evidence file named manifest.json is rejected as input.
+- C1-h: an evidence file named manifest.json, a symlinked evidence
+  directory and an unreadable evidence directory are each rejected as
+  input with nothing published; the staging residue holds no evidence.
 - C2-a: producer fixtures carry evidence fields only; no verdict field
   exists anywhere in the producer schema.
 - C3-a: a sweep during a pack skips the live locked staging and the
