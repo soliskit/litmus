@@ -504,7 +504,8 @@ def r7(t: str) -> str:
     started = datetime.fromisoformat(receipt["started"])
     ended = datetime.fromisoformat(receipt["ended"])
     assert started.tzinfo is not None and ended.tzinfo is not None
-    assert ended >= started
+    # No ordering check: started and ended are wall clock, which can step
+    # backward during a run. Only runtime_seconds is monotonic.
     assert receipt["runtime_seconds"] >= 0
     assert receipt["output"]["path"] == "framing.json.log"
     stdout_receipt = json.loads(r.stdout)
