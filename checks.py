@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
+from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACKAGER = os.path.join(HERE, "packager.py")
@@ -281,43 +282,136 @@ def c1e(t: str) -> str:
     )
 
 
-@check("C1-f consumer fail-closed: absent/missing/incomplete/mismatch/unknown-framing")
+@check(
+    "C1-f consumer fail-closed: absent/missing/incomplete/mismatch/unknown-framing,"
+    " malformed fields, unpublished or renamed directories, symlinks, unreadable dirs"
+)
 def c1f(t: str) -> str:
     import verifier
 
     make_evidence(t)
     run([PACKAGER, os.path.join(t, "evidence"), t, "bundle-c1f"])
     bp = os.path.join(t, "bundle-c1f")
+    assert verifier.verify(bp)["verdict"] == "VALID"
+
+    def copy(label: str, name: str = "bundle-c1f") -> str:
+        # Each case is a copy under the bundle's own name, so only the case's
+        # defect can decide it.
+        dst = os.path.join(t, label, name)
+        shutil.copytree(bp, dst, symlinks=True)
+        return dst
+
+    def edit_manifest(path: str, change: Callable[[dict[str, Any]], None]) -> str:
+        mp = os.path.join(path, "manifest.json")
+        with open(mp) as f:
+            m = json.load(f)
+        change(m)
+        with open(mp, "w") as f:
+            json.dump(m, f)
+        return path
+
+    def refused(path: str, reason: str) -> bool:
+        v = verifier.verify(path)
+        return v["verdict"] == "INVALID" and any(reason in r for r in v["reasons"])
+
     cases: list[tuple[str, bool]] = []
-    cases.append(
-        (
-            "absent",
-            verifier.verify(os.path.join(t, "no-such-bundle"))["verdict"] == "INVALID",
-        )
-    )
-    t2 = os.path.join(t, "c1f-missing")
-    shutil.copytree(bp, t2)
+    cases.append(("absent", refused(os.path.join(t, "no-such-bundle"), "absent")))
+    t2 = copy("missing")
     os.remove(os.path.join(t2, "manifest.json"))
-    cases.append(("missing-manifest", verifier.verify(t2)["verdict"] == "INVALID"))
-    t3 = os.path.join(t, "c1f-incomplete")
-    shutil.copytree(bp, t3)
+    cases.append(("missing-manifest", refused(t2, "manifest.json missing")))
+    t3 = copy("incomplete")
     os.remove(os.path.join(t3, "evidence-0.log"))
-    cases.append(("incomplete", verifier.verify(t3)["verdict"] == "INVALID"))
-    t4 = os.path.join(t, "c1f-mismatch")
-    shutil.copytree(bp, t4)
+    cases.append(("incomplete", refused(t3, "listed file absent")))
+    t4 = copy("mismatch")
     with open(os.path.join(t4, "evidence-1.log"), "a") as f:
         f.write("tampered\n")
-    cases.append(("hash-mismatch", verifier.verify(t4)["verdict"] == "INVALID"))
-    t5 = os.path.join(t, "c1f-framing")
-    shutil.copytree(bp, t5)
-    mp = os.path.join(t5, "manifest.json")
-    m = json.load(open(mp))
-    m["verdict"] = "VALID"
-    json.dump(m, open(mp, "w"))
-    cases.append(("unknown-framing", verifier.verify(t5)["verdict"] == "INVALID"))
+    cases.append(("hash-mismatch", refused(t4, "hash mismatch")))
+    t5 = edit_manifest(copy("framing"), lambda m: m.update(verdict="VALID"))
+    cases.append(("unknown-framing", refused(t5, "unknown manifest framing")))
+
+    # Every manifest field has an exact type; stray keys are refused anywhere.
+    def first_entry(m: dict[str, Any]) -> dict[str, Any]:
+        entry: dict[str, Any] = m["files"]["evidence-0.log"]
+        return entry
+
+    malformed: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
+        ("bundle-number", lambda m: m.update(bundle=123), "not a valid bundle name"),
+        ("bundle-null", lambda m: m.update(bundle=None), "not a valid bundle name"),
+        (
+            "bundle-path",
+            lambda m: m.update(bundle="../../elsewhere"),
+            "not a valid bundle name",
+        ),
+        ("version-bool", lambda m: m.update(version=True), "manifest version"),
+        ("created-number", lambda m: m.update(created=5), "manifest created"),
+        (
+            "entry-verdict",
+            lambda m: first_entry(m).update(verdict="VALID"),
+            "malformed manifest entry",
+        ),
+        (
+            "entry-size-float",
+            lambda m: first_entry(m).update(size=float(first_entry(m)["size"])),
+            "malformed manifest entry",
+        ),
+    ]
+    for label, change, reason in malformed:
+        cases.append((label, refused(edit_manifest(copy(label), change), reason)))
+
+    # Only the exact published directory validates.
+    cases.append(
+        (
+            "renamed-copy",
+            refused(copy("renamed", "bundle-c1f-renamed"), "not the declared bundle"),
+        )
+    )
+    os.makedirs(os.path.join(t, "linked"))
+    linked = os.path.join(t, "linked", "bundle-c1f")
+    os.symlink(bp, linked)
+    cases.append(("symlinked-bundle", refused(linked, "bundle path is a symlink")))
+    # A real failed publish: a dangling symlink at the publish path leaves a
+    # complete staging directory behind.
+    pub = os.path.join(t, "publish")
+    os.makedirs(pub)
+    os.symlink("/nonexistent-target", os.path.join(pub, "bundle-c1f"))
+    r = run([PACKAGER, os.path.join(t, "evidence"), pub, "bundle-c1f"])
+    assert r.returncode == 1, r.stderr
+    staging = [f for f in os.listdir(pub) if f.startswith(".staging-bundle-c1f-")]
+    assert len(staging) == 1, staging
+    sp = os.path.join(pub, staging[0])
+    assert os.path.isfile(os.path.join(sp, "manifest.json")), "staging not complete"
+    cases.append(("complete-staging", refused(sp, "not the declared bundle")))
+
+    # Every entry is accounted for; a symlinked manifest is refused.
+    t6 = copy("extra-symlink")
+    os.symlink(os.path.join(t, "evidence"), os.path.join(t6, "extra-dir"))
+    cases.append(("extra-symlinked-dir", refused(t6, "unexpected symlink")))
+    t7 = copy("manifest-symlink")
+    outside = os.path.join(t, "outside-manifest.json")
+    shutil.move(os.path.join(t7, "manifest.json"), outside)
+    os.symlink(outside, os.path.join(t7, "manifest.json"))
+    cases.append(("manifest-symlink", refused(t7, "not a regular file")))
+    t8 = copy("unreadable")
+    hidden = os.path.join(t8, "hidden")
+    os.makedirs(hidden)
+    with open(os.path.join(hidden, "z.txt"), "w") as f:
+        f.write("unlisted\n")
+    os.chmod(hidden, 0)
+    try:
+        if os.access(hidden, os.R_OK):
+            raise AssertionError("account bypasses mode 000; run unprivileged")
+        cases.append(("unreadable-dir", refused(t8, "unreadable")))
+    finally:
+        os.chmod(hidden, 0o700)
     failed = [n for n, ok in cases if not ok]
     assert not failed, failed
-    return "5 classes all INVALID"
+    return (
+        f"{len(cases)} cases all INVALID, each for its own reason: absent, "
+        "missing, incomplete, hash mismatch, unknown framing, "
+        f"{len(malformed)} malformed fields, a renamed copy, a symlinked "
+        "bundle path, complete staging from a failed publish, an extra "
+        "symlinked directory, a symlinked manifest and an unreadable directory"
+    )
 
 
 @check("C1-g stale/foreign verdict rejected against current bytes and identity")

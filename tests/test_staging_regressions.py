@@ -10,8 +10,10 @@ controlled scheduling tests, not a measurement of ordinary race frequency.
 import contextlib
 import errno
 import fcntl
+import hashlib
 import importlib.util
 import io
+import json
 import os
 import stat
 import tempfile
@@ -231,3 +233,63 @@ class RecorderSkipRegressions(unittest.TestCase):
         self.assertEqual(ran, ["R1", "R3"])
         self.assertIn("FAIL R3 stub three: R3 stub failure", out.getvalue())
         self.assertIn("3 checks, 1 failures, 1 skipped", out.getvalue())
+
+
+class PublishedPathRegressions(unittest.TestCase):
+    """Only the exact published directory validates."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="litmus-regression-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.evidence = self.root / "evidence"
+        self.evidence.mkdir()
+        (self.evidence / "a.txt").write_bytes(b"alpha\n")
+
+    def test_complete_staging_from_a_failed_publish_and_its_verdict_are_refused(
+        self,
+    ) -> None:
+        import verifier
+
+        output = self.root / "output"
+        output.mkdir()
+        (output / "bundle-x").symlink_to("/nonexistent-target")
+        with self.assertRaises(FileExistsError):
+            packager.pack(str(self.evidence), str(output), "bundle-x")
+        staging = [p for p in output.iterdir() if p.name.startswith(".staging-")]
+        self.assertEqual(len(staging), 1)
+        self.assertTrue((staging[0] / "manifest.json").is_file())
+        result = verifier.verify(str(staging[0]))
+        self.assertEqual(result["verdict"], "INVALID")
+        self.assertIn("not the declared bundle name", "; ".join(result["reasons"]))
+        # A verdict as the unfixed verifier issued it for this staging.
+        manifest = (staging[0] / "manifest.json").read_bytes()
+        stored = verifier._verdict(
+            "VALID",
+            "bundle-x",
+            str(staging[0]),
+            hashlib.sha256(manifest).hexdigest(),
+            [],
+        )
+        verdict_path = self.root / "verdict.json"
+        verdict_path.write_text(json.dumps(stored))
+        accepted, reasons = verifier.check_verdict(str(staging[0]), str(verdict_path))
+        self.assertFalse(accepted)
+        self.assertIn("bundle no longer validates", "; ".join(reasons))
+
+    def test_the_published_bundle_still_validates_and_its_verdict_is_accepted(
+        self,
+    ) -> None:
+        import verifier
+
+        output = self.root / "output"
+        output.mkdir()
+        packager.pack(str(self.evidence), str(output), "bundle-x")
+        published = str(output / "bundle-x")
+        result = verifier.verify(published)
+        self.assertEqual(result["verdict"], "VALID", result["reasons"])
+        verdict_path = self.root / "verdict.json"
+        verdict_path.write_text(json.dumps(result))
+        self.assertEqual(
+            verifier.check_verdict(published, str(verdict_path)), (True, [])
+        )

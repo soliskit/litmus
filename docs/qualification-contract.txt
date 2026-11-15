@@ -46,7 +46,18 @@ GUARANTEES
   this guarantee. Sweep results list removed and skipped entries; a
   skipped entry is not proof that an attempted removal left it untouched.
 - Fail-closed consumption. Absent, missing, incomplete, mismatched, or
-  unknown-framing bundles are invalid. Stale verdicts (changed evidence)
+  unknown-framing bundles are invalid. Only the exact published
+  directory validates: a bundle path that is a symlink, or a directory
+  whose name is not the valid bundle name its manifest declares, is
+  invalid, so unpublished staging, a copy under another name and a
+  renamed bundle never validate. Every manifest field has an exact type:
+  version is the integer 1, bundle a valid bundle name, created a
+  timezone-aware ISO timestamp string, and files a non-empty map whose
+  entries hold exactly sha256 (64 lowercase hex) and size (a
+  non-negative integer); any other key is unknown framing. manifest.json
+  must be a regular file. Every entry in the bundle is accounted for: a
+  symlink, an unreadable directory or an unlisted file makes the bundle
+  invalid. Stale verdicts (changed evidence)
   and foreign verdicts (different bundle) are rejected against the
   current bytes and identity. An evidence file named manifest.json is
   refused as input (reserved-name collision). Abusive bundle names are
@@ -92,7 +103,10 @@ CHECK DEFINITIONS (what the gate's 16 checks verify)
 - C1-e: cross-filesystem staging is rejected on a real second
   filesystem.
 - C1-f: the consumer fails closed on absent, missing, incomplete,
-  mismatched, and unknown-framing bundles.
+  mismatched, unknown-framing and malformed-field bundles, on complete
+  staging left by a real failed publish, a renamed copy and a symlinked
+  bundle path, and on an extra symlinked directory, a symlinked manifest
+  and an unreadable directory; each case is decided by its own reason.
 - C1-g: stale and foreign verdicts are rejected against current bytes
   and identity; a fresh verdict is accepted.
 - C1-h: an evidence file named manifest.json is rejected as input.
