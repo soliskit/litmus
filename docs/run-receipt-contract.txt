@@ -1,0 +1,139 @@
+RUN RECEIPT CONTRACT
+Owner-side qualification tooling: run receipt recorder.
+Python 3 standard library only. Ordinary defensive code: no root, no
+mounts, no environment or sandbox mechanics. git is used only to read
+HEAD and worktree state.
+
+COMPONENTS
+- recorder.py (producer): runs one command once and publishes a receipt
+  plus its captured output log. The recorder emits a record of one
+  observed run only. It emits no verdict about the run's meaning.
+- recorder-checks.py (gate): 10 checks over the recorder, using real
+  mechanisms only: a real git work tree, real subprocesses, a real
+  timeout enforced by a real SIGKILL of the run's process group, and
+  real existing files for the no-overwrite refusals.
+
+RECEIPT FIELDS (version 1; the exact set, no more and no fewer)
+- version: receipt schema version, 1.
+- commit: the 40-hex HEAD of the working directory at launch, or the
+  --commit override. Load-bearing: without it there is no receipt.
+- worktree_clean: true or false from git status at launch; null when
+  the commit came from --commit, where the recorder establishes
+  nothing about the worktree.
+- argv: the exact argument vector that ran, element for element.
+- cwd: the absolute working directory the command ran in. Recorded raw.
+- started, ended: wall-clock UTC ISO timestamps of the run. NOT
+  monotonic.
+- runtime_seconds: the measured duration on a monotonic clock, rounded
+  to milliseconds.
+- timeout_seconds: the --timeout value, or null when none was set.
+- timed_out: true exactly when the timeout fired.
+- exit: the process exit code, or null when the run ended by a signal.
+- signal: the signal number that ended the run, or null. A timeout
+  usually ends the run with SIGKILL (9), but a natural exit can race
+  the kill; whatever actually ended the run is recorded.
+- output: {path, sha256, bytes} of the captured combined stdout and
+  stderr log, published beside the receipt.
+
+GUARANTEES
+- Exact argv record. The vector that ran is the vector recorded.
+- Monotonic runtime. runtime_seconds is measured on a monotonic clock,
+  independent of wall-clock changes.
+- No overwrite. An existing receipt path or output log path refuses
+  the run BEFORE the command starts. Publication is two atomic
+  no-overwrite hard links, log first then receipt; after the receipt
+  link the pair is complete.
+- Frozen log. The published log is a frozen copy of the run's captured
+  output: it holds what the run had written when the recorder froze
+  it, shortly after the direct child exited (after a firing timeout,
+  after the group kill). Output written later by surviving processes
+  is not captured, and the cutoff under still-writing processes is
+  not exact. The published log never changes after the receipt is
+  written.
+- Real timeout. A firing timeout sends a real SIGKILL to the run's
+  whole process group; timed_out means the deadline fired, and exit
+  and signal record how the run actually ended, since a natural exit
+  can race the kill. The recorder exits 124 whenever timed_out is
+  true.
+- Exit propagation. Otherwise the recorder exits with the run's own
+  code, or 128 plus the signal number when a signal ended the run.
+
+NON-CLAIMS
+- A receipt records ONE OBSERVED run. It is not a minimum-runtime
+  proof, not a benchmark, and not a performance bound.
+- A receipt is not a CI result and replaces no CI; CI records its own
+  runs.
+- A receipt makes no supported-environment claim. Interpreters,
+  dependency floors and platform support are the caller's to state in
+  the run's own method text.
+- started/ended are wall clock and can move with the clock; only
+  runtime_seconds is monotonic.
+- cwd and argv are recorded raw, including local absolute paths.
+  Normalizing machine-specific paths is a separate publication step,
+  never the recorder's edit.
+- A receipt is not a signature and proves nothing about who ran it.
+- An output log without its receipt is not a receipt and carries no
+  meaning.
+- The gate qualifies the recorder's own behavior only. It certifies
+  nothing about any run the recorder records.
+
+USAGE
+    python3 recorder.py RECEIPT_PATH [--timeout SECONDS] [--cwd DIR] [--commit COMMIT] -- COMMAND [ARG...]
+    python3 recorder-checks.py
+
+Defaults: --cwd is the current directory; the commit comes from git
+HEAD there. Outside a git work tree, --commit is required. The receipt
+is written to RECEIPT_PATH and the captured output to RECEIPT_PATH.log.
+
+CHECK DEFINITIONS (what the gate's 10 checks verify)
+- R1: a passing run is recorded exactly - commit, argv, cwd, exit 0,
+  and the output hash and bytes match the published log.
+- R2: a failing exit code is recorded and propagated.
+- R3: a real timeout kills the run's process group with a real
+  SIGKILL; the child is really dead, the receipt records timed_out, a
+  null exit and signal 9, and the recorder exits 124.
+- R4: an existing receipt or an existing output log refuses the run
+  before the command starts; the existing bytes are untouched.
+- R5: outside a git work tree with no --commit there is no receipt; a
+  --commit override is recorded with worktree_clean null; a malformed
+  --commit is refused.
+- R6: a dirty worktree is recorded as worktree_clean false, not hidden.
+- R7: the receipt carries exactly the schema's fields, the UTC
+  timestamps parse and order, and the printed receipt equals the
+  published file.
+- R8: the published log is frozen: a background descendant's later
+  output never changes it, and the receipt hash still matches.
+- R9: under a firing timeout with a setsid-escaped writer, the
+  published log stays frozen, the hash still matches, and the
+  recorder exits 124.
+- R10: a runaway writer after the child's exit cannot keep the
+  recorder copying forever; the recorder terminates with a bounded
+  snapshot whose hash matches the published log.
+
+QUALIFICATION RUNS
+November 12, 2026: the 10-check gate passed 10 of 10 on the current
+sources via bare `python3 recorder-checks.py` startup, using CPython
+3.10.12 on unprivileged Linux x86-64.
+
+- CI qualification: on each pull request and push to main, R1-R9 run on
+  GitHub-hosted runners with RECORDER_CHECKS_SKIP=R10. R10 is excluded in
+  CI: its flood's disk fit on a 14 GB runner is unverified. The variable
+  accepts only "R10"; any other value refuses the run. A skipped check
+  prints "skipped by RECORDER_CHECKS_SKIP; no qualification claimed", so
+  every CI log names the gap. R10 keeps qualifying locally under the
+  bounded controls after any edit to recorder.py or recorder-checks.py;
+  the dated entries above record those runs.
+
+November 13, 2026: the 10-check gate passed 10 of 10 on the sources of
+this change (the RECORDER_CHECKS_SKIP mechanism added), via bare
+`python3 recorder-checks.py` startup in a network-isolated environment,
+using CPython 3.10.12 on unprivileged Linux x86-64. R10 terminated in
+5.9s with a bounded 3719299072-byte snapshot; hash matched. Free disk
+was 497 GB before and after; no gate temp files remained after the
+cleanup audit. The skip mechanism was verified live the same day:
+an unknown or non-R10 value refuses with exit 2 before anything runs;
+RECORDER_CHECKS_SKIP=R10 ran R1-R9, printed the SKIP line, and exited 0
+with "10 checks, 0 failures, 1 skipped".
+
+Re-qualify with: python3 recorder-checks.py (10 checks; exit 0 means all
+pass). After any edit to the tool files, re-run the gate.
