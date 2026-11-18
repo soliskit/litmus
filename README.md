@@ -1,7 +1,7 @@
 # litmus
 
-Owner-side qualification tooling: an evidence-bundle packager and
-verifier, plus the gate that qualifies them.
+Tools for packaging and verifying test evidence: an evidence-bundle
+packager and verifier, a run recorder, and the gates that qualify them.
 
 This repository holds a small set of Python tools and carries no
 application code. CI runs lint, formatting, type checks, staging
@@ -32,6 +32,13 @@ pushes to main. The disk-heavy R10 check remains local.
 - `docs/run-receipt-contract.txt` - the recorder's technical contract:
   receipt fields, guarantees, non-claims, usage, check definitions, and
   the dated qualification runs.
+- `tests/test_staging_regressions.py` - focused regression tests for the
+  sweep-inspection and staging-lock fixes.
+- `docs/requirements.md` and `docs/decisions.md` - the numbered
+  requirements and the decision rows behind adopted changes.
+- `docs/qualification-evidence.md` - the November 10, 2026 evidence
+  record: executed-source hashes, the gate result, focused evidence and
+  the limits found then.
 
 ## Requirements
 
