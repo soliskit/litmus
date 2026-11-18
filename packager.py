@@ -232,13 +232,16 @@ def valid_bundle_name(name: str) -> bool:
     return True
 
 
-def collect_evidence(evidence_dir: str) -> dict[str, str]:
-    """Return {relpath: abspath} for regular files only; refuse the rest,
-    including any input named manifest.json (reserved for the bundle's own
-    manifest). A symlinked directory, a directory that cannot be read and
-    an empty directory, which the manifest cannot carry, are refused too,
-    so nothing under evidence_dir is skipped silently."""
-    entries: dict[str, str] = {}
+def collect_evidence(evidence_dir: str) -> dict[str, tuple[str, int, int]]:
+    """Return {relpath: (abspath, dev, ino)} for regular files only; refuse
+    the rest, including any input named manifest.json (reserved for the
+    bundle's own manifest). A symlinked directory, a directory that cannot
+    be read and an empty directory, which the manifest cannot carry, are
+    refused too, so nothing under evidence_dir is skipped silently. The
+    device and inode are the entry's identity at collection: the copy
+    rechecks them, because a path kept as a bare string can be made to
+    name a different file after collection."""
+    entries: dict[str, tuple[str, int, int]] = {}
 
     def refuse_unreadable(error: OSError) -> None:
         rel = os.path.relpath(str(error.filename), evidence_dir)
@@ -260,7 +263,8 @@ def collect_evidence(evidence_dir: str) -> dict[str, str]:
                 raise ValueError(f"non-regular evidence file refused: {rel}")
             if rel == RESERVED_NAME:
                 raise ValueError(f"evidence file collides with reserved name: {rel}")
-            entries[rel] = ap
+            st = os.stat(ap)
+            entries[rel] = (ap, st.st_dev, st.st_ino)
     if not entries:
         raise ValueError("evidence directory is empty")
     return entries
@@ -334,10 +338,21 @@ def pack(
 
         manifest_files: dict[str, dict[str, object]] = {}
         copied = 0
-        for rel, src in entries.items():
+        for rel, (src, dev, ino) in entries.items():
             dst = os.path.join(staging, rel)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            with open(src, "rb") as f:
+            # Collection is not a snapshot: an entry edited in place is
+            # still read as it is, but an entry replaced since collection
+            # (swapped for a symlink, renamed into place) is a different
+            # file, so refuse instead of packing content never collected.
+            try:
+                fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError as e:
+                raise ValueError(f"evidence changed after collection: {rel}") from e
+            with os.fdopen(fd, "rb") as f:
+                now = os.fstat(f.fileno())
+                if (now.st_dev, now.st_ino) != (dev, ino):
+                    raise ValueError(f"evidence changed after collection: {rel}")
                 data = f.read()
             _write_sync(dst, data)
             copied += 1
@@ -409,6 +424,11 @@ def recover_sweep(
     appends one escaped, single-line "name: reason" per skipped entry;
     the returned tuple is unchanged."""
     import shutil
+
+    # Resolve the path exactly as pack does: the kernel resolves a '..'
+    # after a symlink differently from abspath, and pack staged under the
+    # abspath, so the sweep must look where pack actually wrote.
+    out_parent = os.path.abspath(out_parent)
 
     def note(fn: str, reason: str) -> None:
         skipped.append(fn)

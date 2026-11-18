@@ -75,7 +75,10 @@ GUARANTEES
 
 PER-ATTEMPT STAGING LIFECYCLE
 - Validate and collect evidence paths before allocating staging. Collection
-  is not a snapshot; later reads and writes may still fail.
+  is not a snapshot: an entry edited in place is read as it is at copy
+  time, and later reads and writes may still fail. An entry replaced after
+  collection - swapped for a symlink or renamed into place - is a
+  different file and is refused, with nothing published.
 - After allocation returns the held staging lock, an Exception before
   publication attempts removal only of this attempt's unpublished staging.
   Keep the lock held and refuse deletion if named/held identity differs,
@@ -153,15 +156,24 @@ CHECK DEFINITIONS (what the gate's 16 checks verify)
 - C3-c: a sweep on a missing OUT_PARENT refuses cleanly.
 
 QUALIFICATION RUNS
-November 14, 2026: the 16-check gate passed 16 of 16 on the current
-sources via bare `python3 checks.py` startup from the repository root,
+November 17, 2026: the 16-check gate passed 16 of 16 on the sources of
+this change via bare `python3 checks.py` startup from the repository
+root, using CPython 3.10.12 on unprivileged Linux x86-64. The same
+tree passed ruff check, ruff format --check (13 files), mypy (6 source
+files) and the 51 staging-regression unit tests, including the ten
+regressions added with this change: on the previous sources eight
+fail behaviorally and two error only because the anchoring mechanism
+does not exist there; all ten pass on these sources.
+
+November 14, 2026: the 16-check gate passed 16 of 16 on the sources of
+that date via bare `python3 checks.py` startup from the repository root,
 using CPython 3.10.12 on unprivileged Linux x86-64. The same run
 passed ruff check, ruff format --check (13 files), mypy (6 source
 files) and the 10 staging-regression unit tests. These sources are the
 fourteen-issue batch merged through pull requests #23 to #31.
 
-November 12, 2026: the 16-check gate passed 16 of 16 on the current
-sources via bare `python3 checks.py` startup from the repository root
+November 12, 2026: the 16-check gate passed 16 of 16 on the sources of
+that date via bare `python3 checks.py` startup from the repository root
 and from a foreign working directory, using CPython 3.10.12 on
 unprivileged Linux x86-64.
 
@@ -177,10 +189,14 @@ its nested subprocess output capture has no hard memory bound. The
 exact bytes of that run are recorded in docs/qualification-evidence.md.
 
 - CI qualification: on each pull request and push to main, all 16 checks
-  run on GitHub-hosted runners; nothing is excluded.
+  run on GitHub-hosted runners; nothing is excluded. The gate refuses to
+  run with assertions disabled (python -O / PYTHONOPTIMIZE): exit 2, no
+  PASS claimed.
 
 Re-qualify with python3 checks.py in a safe owned environment, or the
 explicitly accepted scoped-directory invocation above. After any edit
 to the tool files, rerun the gate. Do not sweep
 a shared second-filesystem namespace merely to reproduce this command.
-See qualification-evidence.md for the evidence limits and known defects.
+See qualification-evidence.md for the evidence limits of the November 10
+accepted run; it is a dated record - several defects it lists are fixed
+since - not a list of current defects.

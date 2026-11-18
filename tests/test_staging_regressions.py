@@ -1,4 +1,8 @@
-"""Focused regressions for sweep inspection and the staging-name lock window.
+"""Focused regressions: sweep inspection, the staging-name lock window,
+gate startup refusals (RECORDER_CHECKS_SKIP and assertions-disabled),
+evidence identity after collection, sweep path resolution, worktree
+cleanliness against user-level git config, gate cleanup kills, and
+per-attempt staging ownership.
 
 Run from the repository root:
     python3 -m unittest discover -s tests -p test_staging_regressions.py
@@ -7,6 +11,7 @@ Linux directory flock and an unprivileged account are required. These are
 controlled scheduling tests, not a measurement of ordinary race frequency.
 """
 
+import array
 import ast
 import contextlib
 import errno
@@ -16,7 +21,9 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -1157,6 +1164,275 @@ class GateWitnessRegressions(unittest.TestCase):
         with patch.object(rc, "RECORDER", str(mutant)):
             with self.assertRaises(AssertionError):
                 rc.r7(self.workdir())
+
+
+class AssertionsDisabledRegressions(unittest.TestCase):
+    """Both gates refuse to run under python -O / PYTHONOPTIMIZE: a PASS
+    line printed with assertions stripped would certify nothing."""
+
+    def test_gates_refuse_when_assertions_are_disabled(self) -> None:
+        env = dict(os.environ, PYTHONOPTIMIZE="1")
+        for gate in ("checks.py", "recorder-checks.py"):
+            r = subprocess.run(
+                [sys.executable, str(REPO / gate)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            self.assertEqual(r.returncode, 2, f"{gate}: {r.stdout} {r.stderr}")
+            self.assertIn("REFUSED", r.stderr, gate)
+
+
+class EvidenceIdentityRegressions(unittest.TestCase):
+    """An evidence entry replaced after collection is refused. Collection
+    is not a snapshot: only an in-place edit may still be read as it is."""
+
+    def setUp(self) -> None:
+        _unprivileged(self)
+        temp = tempfile.TemporaryDirectory(prefix="litmus-identity-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.evidence = self.root / "evidence"
+        self.output = self.root / "output"
+        self.outside = self.root / "outside"
+        for d in (self.evidence, self.output, self.outside):
+            d.mkdir()
+        (self.evidence / "f1.log").write_bytes(b"evidence-1")
+        (self.evidence / "f2.log").write_bytes(b"evidence-2")
+        (self.outside / "f2.log").write_bytes(b"not evidence")
+
+    def pack_with_swap(self, swap: Callable[[], None]) -> None:
+        def pause(point: str, parent: str, name: str) -> None:
+            if point == "mid_copy":
+                swap()
+
+        with patch.object(packager, "_pause", pause):
+            with self.assertRaisesRegex(ValueError, "changed after collection"):
+                packager.pack(str(self.evidence), str(self.output), "bundle-s")
+        self.assertEqual(os.listdir(self.output), [])
+
+    def test_file_swapped_for_a_symlink_is_refused(self) -> None:
+        def swap() -> None:
+            (self.evidence / "f2.log").unlink()
+            (self.evidence / "f2.log").symlink_to(self.outside / "f2.log")
+
+        self.pack_with_swap(swap)
+
+    def test_directory_swapped_for_a_symlink_is_refused(self) -> None:
+        sub = self.evidence / "sub"
+        sub.mkdir()
+        (sub / "c.log").write_bytes(b"evidence-c")
+        outside_sub = self.outside / "sub"
+        outside_sub.mkdir()
+        (outside_sub / "c.log").write_bytes(b"outside c")
+
+        def swap() -> None:
+            sub.rename(self.root / "moved")
+            sub.symlink_to(outside_sub, target_is_directory=True)
+
+        self.pack_with_swap(swap)
+
+    def test_file_renamed_into_place_is_refused(self) -> None:
+        def swap() -> None:
+            os.rename(self.outside / "f2.log", self.evidence / "f2.log")
+
+        self.pack_with_swap(swap)
+
+
+class RecoverSweepPathRegressions(unittest.TestCase):
+    """--recover-sweep reads OUT_PARENT the way pack resolved it: one
+    string through a symlinked '..' must not name two directories."""
+
+    def setUp(self) -> None:
+        _unprivileged(self)
+        temp = tempfile.TemporaryDirectory(prefix="litmus-sweeppath-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def test_sweep_acts_where_pack_staged(self) -> None:
+        pub = self.root / "pub"
+        (pub / "deep").mkdir(parents=True)
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "hop").symlink_to(pub / "deep", target_is_directory=True)
+        out_parent = elsewhere / "hop" / ".."
+        # pack publishes and stages under abspath(OUT_PARENT) = elsewhere.
+        residue = elsewhere / ".staging-leftover-x"
+        residue.mkdir()
+        foreign = pub / ".staging-foreign-x"
+        foreign.mkdir()
+        (foreign / "payload").write_bytes(b"not this sweep's")
+        removed, _skipped = packager.recover_sweep(str(out_parent))
+        self.assertIn(".staging-leftover-x", removed)
+        self.assertFalse(residue.exists())
+        self.assertNotIn(".staging-foreign-x", removed)
+        self.assertEqual((foreign / "payload").read_bytes(), b"not this sweep's")
+
+
+class WorktreeCleanRegressions(unittest.TestCase):
+    """A user-level core.ignoreCase cannot fold an untracked file into a
+    tracked one that differs only by case: worktree_clean stays false."""
+
+    def setUp(self) -> None:
+        _unprivileged(self)
+        temp = tempfile.TemporaryDirectory(prefix="litmus-ignorecase-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def test_user_level_ignorecase_cannot_hide_an_untracked_file(self) -> None:
+        repo = self.root / "repo"
+        repo.mkdir()
+
+        def git(*args: str) -> None:
+            r = subprocess.run(
+                ["git", "-C", str(repo), *args], capture_output=True, text=True
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+        git("init", "-q")
+        git("config", "user.email", "x@example.invalid")
+        git("config", "user.name", "x")
+        (repo / "README.md").write_bytes(b"tracked")
+        git("add", "README.md")
+        git("commit", "-qm", "init")
+        (repo / "README.MD").write_bytes(b"not committed")
+        home = self.root / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_bytes(b"[core]\n\tignoreCase = true\n")
+        import recorder
+
+        with patch.dict(os.environ, {"HOME": str(home)}):
+            commit, worktree_clean = recorder.resolve_commit(str(repo), None)
+        self.assertIsNotNone(commit)
+        self.assertFalse(worktree_clean)
+
+
+class CleanupKillRegressions(unittest.TestCase):
+    """R3's cleanup signals only the exact processes that anchored
+    themselves, each named by a pidfd the process opened on itself and
+    passed to the gate: a passing run's cleanup signals nothing at all,
+    and a reused live pid is never signalled."""
+
+    def setUp(self) -> None:
+        _unprivileged(self)
+        temp = tempfile.TemporaryDirectory(prefix="litmus-cleanup-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def test_passing_r3_cleanup_signals_nothing(self) -> None:
+        rc = _load_recorder_checks()
+        kills: list[int] = []
+        real_send = signal.pidfd_send_signal
+        real_kill = os.kill
+
+        def observed_send(fd: int, sig: int) -> None:
+            if sig == signal.SIGKILL:
+                kills.append(fd)
+                raise ProcessLookupError  # recorded, never delivered
+            real_send(fd, sig)
+
+        def observed_kill(pid: int, sig: int) -> None:
+            if sig == signal.SIGKILL:
+                kills.append(pid)
+                raise ProcessLookupError  # recorded, never delivered
+            real_kill(pid, sig)
+
+        t = tempfile.mkdtemp(dir=self.root)
+        # Both delivery mechanisms are observed: pidfd_send_signal on this
+        # design, os.kill on the previous sources, where the same passing
+        # run recorded 8 SIGKILL attempts against proven-dead pids.
+        with patch.object(signal, "pidfd_send_signal", observed_send):
+            with patch.object(os, "kill", observed_kill):
+                rc.r3(t)
+        self.assertEqual(kills, [], f"cleanup signalled proven-dead pids {kills}")
+
+    def test_anchor_names_the_sending_process(self) -> None:
+        rc = _load_recorder_checks()
+        sock_path = os.path.join(self.root, "anchor.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.addCleanup(server.close)
+        server.bind(sock_path)
+        member = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                rc.anchor_payload(sock_path) + "; import time; time.sleep(30)",
+            ]
+        )
+        self.addCleanup(member.kill)
+        msg, ancdata, _flags, _addr = server.recvmsg(
+            64, socket.CMSG_LEN(array.array("i").itemsize)
+        )
+        self.assertEqual(int(msg.decode()), member.pid)
+        fds = array.array("i")
+        for level, ctype, cdata in ancdata:
+            if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS:
+                fds.frombytes(cdata[: fds.itemsize])
+        self.assertEqual(len(fds), 1, "anchor carried no pidfd")
+        fd = int(fds[0])
+        # The descriptor names the sender itself: signal 0 succeeds while
+        # it lives, and once it is dead the descriptor fails
+        # ProcessLookupError rather than ever naming another process.
+        signal.pidfd_send_signal(fd, 0)
+        member.kill()
+        member.wait()
+        with self.assertRaises(ProcessLookupError):
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        os.close(fd)
+
+    def test_reap_never_signals_a_reused_pid(self) -> None:
+        rc = _load_recorder_checks()
+        # The process a survivor entry was collected for: dead, descriptor
+        # retained.
+        collected = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        )
+        self.addCleanup(collected.kill)
+        dead_fd = os.pidfd_open(collected.pid)
+        collected.kill()
+        collected.wait()
+        # An unrelated live process now standing at some pid: the entry
+        # pairs its pid with the dead process's descriptor, as a reused
+        # pid would.
+        unrelated = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        )
+        self.addCleanup(unrelated.kill)
+        rc.reap([(unrelated.pid, dead_fd)])
+        self.assertIsNone(unrelated.poll(), "cleanup signalled an unrelated reused pid")
+        # Control: a valid entry for a live process is still signalled.
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        live_fd = os.pidfd_open(live.pid)
+        rc.reap([(live.pid, live_fd)])
+        self.assertEqual(live.wait(), -signal.SIGKILL)
+
+
+class ConcurrentStagingRegressions(unittest.TestCase):
+    """C1-e judges and removes only its own attempt's staging, never a
+    concurrent run's staging created during the attempt."""
+
+    def setUp(self) -> None:
+        _unprivileged(self)
+        temp = tempfile.TemporaryDirectory(prefix="litmus-concurrent-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def test_c1e_leaves_another_runs_staging_untouched(self) -> None:
+        checks = _load_checks()
+        if checks.SECOND_FS is None:
+            self.skipTest("no second filesystem in this environment")
+        foreign = Path(checks.SECOND_FS) / ".staging-bundle-c1e-foreignrun"
+        self.addCleanup(lambda: shutil.rmtree(foreign, ignore_errors=True))
+
+        def pause(point: str, parent: str, name: str) -> None:
+            if point == "after_staging_created" and not foreign.exists():
+                foreign.mkdir()
+
+        t = tempfile.mkdtemp(dir=self.root)
+        with patch.object(packager, "_pause", pause):
+            checks.c1e(t)
+        self.assertTrue(foreign.is_dir(), "C1-e removed another run's live staging")
 
 
 class EntryPointRegression(unittest.TestCase):

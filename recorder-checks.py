@@ -9,10 +9,13 @@ gate qualifies the recorder's own behavior ONLY; it certifies nothing
 about any run the recorder records.
 """
 
+import array
 import json
 import os
+import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -148,32 +151,64 @@ def r2(t: str) -> str:
     return "exit 3 recorded; recorder exits 3"
 
 
-def gone(pid: int, wait: float = 5.0) -> bool:
-    """True once pid has exited. A killed process whose parent died may stay
-    a zombie until it is reaped; it counts as gone."""
-    deadline = time.monotonic() + wait
-    while True:
+def reap(survivors: list[tuple[int, int]]) -> None:
+    """SIGKILL only the exact processes that anchored themselves, each
+    named by a pidfd the process opened on itself and passed here. A
+    member already dead is skipped with no signal: its descriptor polls
+    as exited, and even a signal attempted against a dead member fails
+    ProcessLookupError, because the descriptor still names the original
+    process and can never reach a reuser of its pid. Descriptors are
+    closed either way."""
+    for _pid, fd in survivors:
         try:
-            with open(f"/proc/{pid}/stat") as f:
-                state = f.read().rsplit(")", 1)[1].split()[0]
-        except FileNotFoundError:
-            return True
-        if state == "Z":
+            if not exited(fd, wait=0):
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        finally:
+            os.close(fd)
+
+
+def exited(fd: int, wait: float = 5.0) -> bool:
+    """True once the process a pidfd names has exited. The descriptor
+    becomes readable at exit, zombie or reaped alike, and never goes
+    readable for an unrelated process that later reuses the pid."""
+    deadline = time.monotonic() + wait
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    while True:
+        if poller.poll(0):
             return True
         if time.monotonic() > deadline:
             return False
         time.sleep(0.05)
 
 
-def group_child(pidfile: str, descendant_pidfile: str) -> str:
-    """A run whose child starts a background descendant in its own process
-    group, records both pids, then sleeps."""
+def anchor_payload(sock_path: str) -> str:
+    """Fixture prefix: open a pidfd on this very process and pass it to
+    the gate over the run's unix socket, with the pid as a label. The
+    process anchors itself from inside, so the descriptor provably names
+    the sender: there is no pidfile and no window in which the pid could
+    die and be reused before the gate anchors it."""
     return (
-        "import os, subprocess, sys, time; "
-        "d = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
-        f"open({descendant_pidfile!r}, 'w').write(str(d.pid)); "
-        f"open({pidfile!r}, 'w').write(str(os.getpid())); "
-        "print('before-sleep', flush=True); time.sleep(60)"
+        "import array, os, socket; "
+        "_fd = os.pidfd_open(os.getpid()); "
+        "_s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); "
+        f"_s.connect({sock_path!r}); "
+        "_s.sendmsg([str(os.getpid()).encode()], "
+        "[(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [_fd]))])"
+    )
+
+
+def group_child(sock_path: str) -> str:
+    """A run whose child starts a background descendant in its own process
+    group; each member anchors itself with the gate, then sleeps."""
+    descendant = anchor_payload(sock_path) + "; import time; time.sleep(60)"
+    return (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {descendant!r}]); "
+        + anchor_payload(sock_path)
+        + "; print('before-sleep', flush=True); import time; time.sleep(60)"
     )
 
 
@@ -204,13 +239,50 @@ def r3(t: str) -> str:
         assert not os.path.exists(marker), f"command ran with --timeout {bad}"
         assert not os.path.exists(rp), f"receipt written with --timeout {bad}"
     rp = os.path.join(t, "slow.json")
-    pidfile = os.path.join(t, "child.pid")
-    descendant_pidfile = os.path.join(t, "descendant.pid")
-    survivors: list[int] = []
+    sock_path = os.path.join(t, "anchors.sock")
+    anchors = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    anchors.bind(sock_path)
+    # Each survivor is (pid, pidfd) the process passed about itself over
+    # the run's socket: self-anchored, so the descriptor provably names
+    # that exact process, and a pidfd never names a reused pid. Cleanup
+    # can only ever signal the processes this run anchored.
+    survivors: list[tuple[int, int]] = []
+
+    def collect(expected: int) -> None:
+        """Receive self-anchored pidfds until expected members have checked
+        in. The pid label is cross-checked against the descriptor's own
+        fdinfo, so a mismatched anchor fails here rather than at kill."""
+        deadline = time.monotonic() + 20
+        for _ in range(expected):
+            assert proc.poll() is None, proc.communicate()
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "run members never anchored"
+            anchors.settimeout(remaining)
+            try:
+                msg, ancdata, _flags, _addr = anchors.recvmsg(
+                    64, socket.CMSG_LEN(array.array("i").itemsize)
+                )
+            except TimeoutError:
+                raise AssertionError("run members never anchored") from None
+            pid = int(msg.decode())
+            fds = array.array("i")
+            for level, ctype, cdata in ancdata:
+                if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS:
+                    fds.frombytes(cdata[: fds.itemsize])
+            assert len(fds) == 1, "anchor carried no pidfd"
+            fd = int(fds[0])
+            with open(f"/proc/self/fdinfo/{fd}") as f:
+                labelled = next(
+                    int(line.split()[1]) for line in f if line.startswith("Pid:")
+                )
+            assert labelled == pid, (labelled, pid)
+            survivors.append((pid, fd))
+
     try:
         t0 = time.monotonic()
-        r = run(
+        proc = subprocess.Popen(
             [
+                sys.executable,
                 RECORDER,
                 rp,
                 "--cwd",
@@ -220,21 +292,25 @@ def r3(t: str) -> str:
                 "--",
                 sys.executable,
                 "-c",
-                group_child(pidfile, descendant_pidfile),
-            ]
+                group_child(sock_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
+        # Both members anchor themselves at startup, well before the 1s
+        # timeout kills the group.
+        collect(2)
+        _out, err = proc.communicate(timeout=30)
         wall = time.monotonic() - t0
-        assert r.returncode == 124, (r.returncode, r.stderr)
+        assert proc.returncode == 124, (proc.returncode, err)
         assert wall < 20, f"kill did not return promptly: {wall:.1f}s"
         receipt, _ = read_receipt(rp)
         assert receipt["timed_out"] is True
         assert receipt["exit"] is None
         assert receipt["signal"] == 9
         assert receipt["timeout_seconds"] == 1.0
-        for path in (pidfile, descendant_pidfile):
-            with open(path) as f:
-                survivors.append(int(f.read()))
-        alive = [pid for pid in survivors if not gone(pid)]
+        alive = [pid for pid, fd in survivors if not exited(fd)]
         assert not alive, f"process group members {alive} survived the timeout"
         log = os.path.join(t, "slow.json.log")
         with open(log, "rb") as f:
@@ -244,8 +320,6 @@ def r3(t: str) -> str:
         # long before the run's own deadline.
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             rp = os.path.join(t, f"interrupted-{sig.name}.json")
-            pidfile = os.path.join(t, f"{sig.name}.pid")
-            descendant_pidfile = os.path.join(t, f"{sig.name}-descendant.pid")
             proc = subprocess.Popen(
                 [
                     sys.executable,
@@ -258,34 +332,24 @@ def r3(t: str) -> str:
                     "--",
                     sys.executable,
                     "-c",
-                    group_child(pidfile, descendant_pidfile),
+                    group_child(sock_path),
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            deadline = time.monotonic() + 20
-            while not os.path.exists(pidfile):
-                assert proc.poll() is None, proc.communicate()
-                assert time.monotonic() < deadline, "run never started"
-                time.sleep(0.05)
-            for path in (pidfile, descendant_pidfile):
-                with open(path) as f:
-                    survivors.append(int(f.read()))
+            collect(2)
             proc.send_signal(sig)
             _out, err = proc.communicate(timeout=20)
             assert proc.returncode == 128 + sig, (sig.name, proc.returncode, err)
             assert "Traceback" not in err, err
             assert "interrupted" in json.loads(err)["error"], err
             assert not os.path.exists(rp), f"receipt published after {sig.name}"
-            alive = [pid for pid in survivors[-2:] if not gone(pid)]
+            alive = [pid for pid, fd in survivors[-2:] if not exited(fd)]
             assert not alive, f"run's group members {alive} survived {sig.name}"
     finally:
-        for pid in survivors:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        reap(survivors)
+        anchors.close()
     return (
         "nan, inf, -inf, 0 and -1 timeouts refused before launch; timeout: "
         "timed_out, null exit, signal 9, child and background descendant "
@@ -631,6 +695,13 @@ SKIPPABLE = "R10"  # the one check CI excludes; every other check must run
 
 
 def main() -> int:
+    if not __debug__:
+        print(
+            "REFUSED: assertions are disabled (python -O or PYTHONOPTIMIZE); "
+            "every check is an assert, so no PASS line would mean anything.",
+            file=sys.stderr,
+        )
+        return 2
     raw = os.environ.get(SKIP_ENV)
     if raw is not None and raw.strip() != SKIPPABLE:
         print(
