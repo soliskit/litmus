@@ -235,8 +235,9 @@ def valid_bundle_name(name: str) -> bool:
 def collect_evidence(evidence_dir: str) -> dict[str, str]:
     """Return {relpath: abspath} for regular files only; refuse the rest,
     including any input named manifest.json (reserved for the bundle's own
-    manifest). A symlinked directory and a directory that cannot be read
-    are refused too, so nothing under evidence_dir is skipped silently."""
+    manifest). A symlinked directory, a directory that cannot be read and
+    an empty directory, which the manifest cannot carry, are refused too,
+    so nothing under evidence_dir is skipped silently."""
     entries: dict[str, str] = {}
 
     def refuse_unreadable(error: OSError) -> None:
@@ -245,6 +246,9 @@ def collect_evidence(evidence_dir: str) -> dict[str, str]:
 
     for root, dirs, files in os.walk(evidence_dir, onerror=refuse_unreadable):
         dirs.sort()
+        if root != evidence_dir and not dirs and not files:
+            rel = os.path.relpath(root, evidence_dir)
+            raise ValueError(f"empty evidence directory refused: {rel}")
         for dn in dirs:
             if os.path.islink(os.path.join(root, dn)):
                 rel = os.path.relpath(os.path.join(root, dn), evidence_dir)
@@ -302,6 +306,9 @@ def pack(
     rename. Returns the evidence dict the producer may report (no verdict
     field). Raises on any failure before publish; nothing is published
     then."""
+    # Publish into the same normalized path the result reports. The kernel
+    # resolves a '..' after a symlink differently from abspath.
+    out_parent = os.path.abspath(out_parent)
     if not os.path.isdir(evidence_dir):
         raise ValueError(f"evidence directory not found: {evidence_dir}")
     if not os.path.isdir(out_parent):

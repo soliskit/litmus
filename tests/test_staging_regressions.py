@@ -7,6 +7,7 @@ Linux directory flock and an unprivileged account are required. These are
 controlled scheduling tests, not a measurement of ordinary race frequency.
 """
 
+import ast
 import contextlib
 import errno
 import fcntl
@@ -22,7 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -133,10 +134,6 @@ class StagingRegressions(unittest.TestCase):
         self.assertEqual((reservation / "payload").read_bytes(), b"reservation")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def _load_recorder_checks() -> Any:
     spec = importlib.util.spec_from_file_location(
         "recorder_checks",
@@ -237,6 +234,28 @@ class RecorderSkipRegressions(unittest.TestCase):
         self.assertEqual(ran, ["R1", "R3"])
         self.assertIn("FAIL R3 stub three: R3 stub failure", out.getvalue())
         self.assertIn("3 checks, 1 failures, 1 skipped", out.getvalue())
+
+
+class RecorderGateCleanupRegression(unittest.TestCase):
+    def test_every_check_directory_is_removed_pass_or_fail(self) -> None:
+        rc = _load_recorder_checks()
+        made: list[str] = []
+
+        def leave_files(t: str) -> str:
+            made.append(t)
+            Path(t, "left.txt").write_text("left by a check\n")
+            return "stub"
+
+        def fail(t: str) -> str:
+            leave_files(t)
+            raise RuntimeError("stub failure")
+
+        rc.CHECKS[:] = [("R1 stub one", leave_files), ("R2 stub two", fail)]
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RECORDER_CHECKS_SKIP", None)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(rc.main(), 1)
+        self.assertEqual([os.path.exists(t) for t in made], [False, False])
 
 
 class PublishedPathRegressions(unittest.TestCase):
@@ -679,3 +698,477 @@ class OwnStagingRegressions(unittest.TestCase):
                 self.stage().rmdir()
             finally:
                 os.close = original_close
+
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def _unprivileged(case: unittest.TestCase) -> None:
+    if os.geteuid() == 0:
+        case.skipTest("unprivileged account required")
+
+
+def _gone(pid: int, wait: float = 5.0) -> bool:
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                state = f.read().rsplit(")", 1)[1].split()[0]
+        except FileNotFoundError:
+            return True
+        if state == "Z" or time.monotonic() > deadline:
+            return state == "Z"
+        time.sleep(0.05)
+
+
+def _crash_staging(evidence: Path, output: Path, name: str) -> Path:
+    """Complete unpublished staging left by a real SIGKILL after the manifest."""
+    proc = subprocess.Popen(
+        [sys.executable, packager.__file__, str(evidence), str(output), name],
+        env=dict(os.environ, C1C2_PAUSE_AT="after_manifest"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        ready = output / f".sync-{name}-after_manifest.ready"
+        deadline = time.monotonic() + 30
+        while not ready.exists():
+            assert proc.poll() is None, "producer exited before complete staging"
+            assert time.monotonic() < deadline, "producer pause timed out"
+            time.sleep(0.02)
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+    (staging,) = output.glob(f".staging-{name}-*")
+    return staging
+
+
+class PathResolutionRegressions(unittest.TestCase):
+    """A '..' after a symlink: the path checked, read and reported is one path."""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory(prefix="litmus-paths-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.evidence = self.root / "evidence"
+        self.evidence.mkdir()
+        (self.evidence / "a.txt").write_bytes(b"alpha\n")
+
+    def hop(self, target: Path) -> Path:
+        """Raw path to target's parent through a symlink; abspath says elsewhere."""
+        (self.root / "elsewhere").mkdir()
+        (self.root / "elsewhere" / "hop").symlink_to(target)
+        return self.root / "elsewhere" / "hop" / ".."
+
+    def test_dotdot_after_a_symlink_cannot_validate_crash_staging(self) -> None:
+        import verifier
+
+        output = self.root / "output"
+        output.mkdir()
+        staging = _crash_staging(self.evidence, output, "bundle-x")
+        alias = self.root / "alias"
+        (alias / "any").mkdir(parents=True)
+        (alias / "bundle-x").symlink_to(staging, target_is_directory=True)
+        result = verifier.verify(str(self.hop(alias / "any") / "bundle-x"))
+        self.assertEqual(result["verdict"], "INVALID", result)
+
+    def test_verdict_names_the_directory_it_checked(self) -> None:
+        import verifier
+
+        output = self.root / "output"
+        (output / "deep").mkdir(parents=True)
+        packager.pack(str(self.evidence), str(output), "bundle-x")
+        result = verifier.verify(str(self.hop(output / "deep") / "bundle-x"))
+        self.assertEqual(result["bundle_path"], str(self.root / "elsewhere/bundle-x"))
+        self.assertEqual(result["verdict"], "INVALID", result)
+        self.assertIn("absent", "; ".join(result["reasons"]))
+
+    def test_reported_published_path_holds_the_bundle(self) -> None:
+        import verifier
+
+        output = self.root / "output"
+        (output / "deep").mkdir(parents=True)
+        out_parent = str(self.hop(output / "deep"))
+        published = str(packager.pack(str(self.evidence), out_parent, "z")["published"])
+        self.assertTrue(os.path.isdir(published), published)
+        self.assertEqual(verifier.verify(published)["verdict"], "VALID")
+
+
+class BundleEntryRegressions(unittest.TestCase):
+    """Every entry is read or refused by name: no crash, no silent skip."""
+
+    def setUp(self) -> None:
+        _unprivileged(self)
+        temp = tempfile.TemporaryDirectory(prefix="litmus-entries-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.evidence = self.root / "evidence"
+        self.evidence.mkdir()
+        (self.evidence / "a.txt").write_bytes(b"alpha\n")
+        (self.evidence / "b.txt").write_bytes(b"beta\n")
+
+    def test_unreadable_bundle_entries_are_invalid_not_a_crash(self) -> None:
+        import verifier
+
+        packager.pack(str(self.evidence), str(self.root), "bundle-u")
+        bundle = self.root / "bundle-u"
+        for target, restore, reason in (
+            (bundle, 0o755, "manifest.json could not be inspected"),
+            (bundle / "b.txt", 0o644, "listed file unreadable: b.txt"),
+        ):
+            with self.subTest(target=target.name):
+                target.chmod(0)
+                try:
+                    if os.access(target, os.R_OK):
+                        self.skipTest("account bypasses mode 000")
+                    result = verifier.verify(str(bundle))
+                finally:
+                    target.chmod(restore)
+                self.assertEqual(result["verdict"], "INVALID")
+                self.assertIn(reason, "; ".join(result["reasons"]))
+
+    def test_empty_evidence_directory_is_refused_before_staging(self) -> None:
+        (self.evidence / "empty").mkdir()
+        with self.assertRaisesRegex(ValueError, "empty evidence directory refused"):
+            packager.pack(str(self.evidence), str(self.root), "bundle-e")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["evidence"])
+
+    def test_unlisted_empty_directory_makes_a_bundle_invalid(self) -> None:
+        import verifier
+
+        packager.pack(str(self.evidence), str(self.root), "bundle-e")
+        (self.root / "bundle-e" / "extra" / "empty").mkdir(parents=True)
+        result = verifier.verify(str(self.root / "bundle-e"))
+        self.assertEqual(result["verdict"], "INVALID")
+        self.assertIn(
+            "unexpected empty directory in bundle: extra/empty", result["reasons"]
+        )
+
+
+@contextlib.contextmanager
+def _recorder_handlers(recorder: Any) -> Iterator[None]:
+    previous: dict[signal.Signals, Any] = {
+        s: signal.getsignal(s) for s in recorder.INTERRUPT_SIGNALS
+    }
+    for s in recorder.INTERRUPT_SIGNALS:
+        signal.signal(s, recorder._raise_interrupted)
+    try:
+        yield
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, signal.SIG_DFL if handler is None else handler)
+
+
+class RecorderRegressions(unittest.TestCase):
+    """Real signals and real OS errors at controlled points of a real run."""
+
+    def setUp(self) -> None:
+        _unprivileged(self)
+        temp = tempfile.TemporaryDirectory(prefix="litmus-recorder-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def main(self, receipt: Path, *command: str) -> tuple[int, str]:
+        import recorder
+
+        err = io.StringIO()
+        argv = ["recorder.py", str(receipt), "--cwd", str(self.root)]
+        argv += ["--commit", "d" * 40, "--", *command]
+        with (
+            _recorder_handlers(recorder),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(err),
+        ):
+            status = recorder.main(argv)
+        return status, err.getvalue()
+
+    def test_second_interrupt_cannot_skip_the_group_kill(self) -> None:
+        import recorder
+
+        pidfile = self.root / "run.pid"
+        real_kill = recorder._kill_group
+        calls: list[int] = []
+
+        def kill_group(pid: int) -> None:
+            calls.append(pid)
+            if len(calls) == 1:
+                # A second real interrupt lands before the first kill runs.
+                signal.raise_signal(signal.SIGTERM)
+            real_kill(pid)
+
+        command = f"echo $$ > '{pidfile}'; kill -INT $PPID; exec sleep 30"
+        run = 0
+        try:
+            with (
+                _recorder_handlers(recorder),
+                patch.object(recorder, "_kill_group", kill_group),
+                self.assertRaises(recorder.Interrupted),
+            ):
+                recorder.record(
+                    str(self.root / "r.json"),
+                    ["sh", "-c", command],
+                    str(self.root),
+                    30.0,
+                    "d" * 40,
+                )
+            run = int(pidfile.read_text())
+            self.assertTrue(_gone(run), "the run outlived the interrupted recorder")
+            self.assertFalse((self.root / "r.json").exists())
+        finally:
+            if run and not _gone(run, 0):
+                os.killpg(run, signal.SIGKILL)
+
+    def test_ignore_files_outside_the_repository_hide_no_untracked_file(self) -> None:
+        excludes = self.root / "excludes"
+        excludes.write_text("*.py\n")
+        home = self.root / "home"
+        (home / ".config" / "git").mkdir(parents=True)
+        (home / ".config" / "git" / "ignore").write_text("*.py\n")
+        env = {k: v for k, v in os.environ.items() if k != "XDG_CONFIG_HOME"}
+        for label, extra_env, config in (
+            ("core.excludesFile", {}, ["core.excludesFile", str(excludes)]),
+            ("user ignore file", {"HOME": str(home)}, []),
+        ):
+            with self.subTest(label):
+                repo = self.root / label.replace(" ", "-")
+                repo.mkdir()
+                run_env = dict(env, **extra_env)
+
+                def git(
+                    *args: str, repo: Path = repo, run_env: dict[str, str] = run_env
+                ) -> None:
+                    subprocess.run(
+                        ["git", "-C", str(repo), *args],
+                        check=True,
+                        capture_output=True,
+                        env=run_env,
+                    )
+
+                git("init", "-q")
+                git("config", "user.email", "gate@example.invalid")
+                git("config", "user.name", "Gate")
+                (repo / "tracked.txt").write_text("tracked\n")
+                git("add", "tracked.txt")
+                git("commit", "-q", "-m", "init")
+                if config:
+                    git("config", *config)
+                (repo / "untracked.py").write_text("print('not committed')\n")
+                receipt = self.root / f"{repo.name}.json"
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO / "recorder.py"),
+                        str(receipt),
+                        "--cwd",
+                        str(repo),
+                        "--",
+                        "true",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    env=run_env,
+                )
+                self.assertIs(json.loads(receipt.read_text())["worktree_clean"], False)
+
+    def test_interrupt_after_publication_reports_the_published_receipt(self) -> None:
+        receipt = self.root / "r.json"
+        real_link = os.link
+
+        def link(src: str, dst: str) -> None:
+            real_link(src, dst)
+            if dst == str(receipt):
+                signal.raise_signal(signal.SIGTERM)  # real, just after the link
+
+        with patch.object(os, "link", link):
+            status, err = self.main(receipt, "true")
+        self.assertEqual(status, 128 + signal.SIGTERM)
+        self.assertTrue(receipt.exists())
+        self.assertNotIn("no receipt", err)
+        self.assertIn("receipt was published", err)
+
+    def test_cleanup_failure_after_publication_keeps_the_run_result(self) -> None:
+        receipt = self.root / "r.json"
+        real_link = os.link
+        locked: list[Path] = []
+
+        def link(src: str, dst: str) -> None:
+            real_link(src, dst)
+            if dst == str(receipt):
+                locked.append(Path(src).parent)
+                locked[0].chmod(0o500)  # real EACCES for the cleanup that follows
+
+        try:
+            with patch.object(os, "link", link):
+                status, err = self.main(receipt, "sh", "-c", "exit 3")
+        finally:
+            for staging in locked:
+                staging.chmod(0o700)
+        self.assertEqual(status, 3, err)
+        self.assertTrue(receipt.exists())
+        self.assertIn("staging cleanup failed after publish", err)
+
+    def test_record_leaves_no_descriptor_open(self) -> None:
+        import recorder
+
+        before = set(os.listdir("/proc/self/fd"))
+        recorder.record(
+            str(self.root / "r.json"), ["true"], str(self.root), None, "d" * 40
+        )
+        self.assertEqual(set(os.listdir("/proc/self/fd")), before)
+
+    def test_receipt_link_failure_is_reported_not_its_cleanup_failure(self) -> None:
+        import recorder
+
+        parent = self.root / "receipts"
+        parent.mkdir()
+        receipt = parent / "r.json"
+        real_link = os.link
+
+        def link(src: str, dst: str) -> None:
+            if dst == str(receipt):
+                parent.chmod(0o555)  # real EACCES for this link and the log cleanup
+            real_link(src, dst)
+
+        try:
+            with (
+                patch.object(os, "link", link),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(OSError) as caught,
+            ):
+                recorder.record(str(receipt), ["true"], str(self.root), None, "d" * 40)
+        finally:
+            parent.chmod(0o755)
+        self.assertEqual(caught.exception.filename2, str(receipt))
+
+
+def _load_checks() -> Any:
+    spec = importlib.util.spec_from_file_location("litmus_checks", REPO / "checks.py")
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _mutant(directory: Path, name: str, *edits: tuple[str, str]) -> Path:
+    """A copy of a tool carrying one defect a gate check exists to catch."""
+    text = (REPO / name).read_text()
+    for old, new in edits:
+        assert text.count(old) == 1, old
+        text = text.replace(old, new)
+    path = directory / name
+    path.write_text(text)
+    return path
+
+
+class GateWitnessRegressions(unittest.TestCase):
+    """Each check fails against a tool with the defect its PASS line rules out."""
+
+    def setUp(self) -> None:
+        _unprivileged(self)
+        temp = tempfile.TemporaryDirectory(prefix="litmus-witness-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def workdir(self) -> str:
+        return tempfile.mkdtemp(prefix="gate-", dir=self.root)
+
+    def test_f3_fails_when_a_refused_republish_changes_the_bundle(self) -> None:
+        checks = _load_checks()
+        refusal = (
+            '        raise ValueError(f"published path already exists: {published}")'
+        )
+        damage = (
+            '        with open(os.path.join(published, "evidence-1.log"), "ab") as f:\n'
+            '            f.write(b"changed by a refused republish\\n")\n'
+        )
+        mutant = _mutant(self.root, "packager.py", (refusal, damage + refusal))
+        with patch.object(checks, "PACKAGER", str(mutant)):
+            with self.assertRaises(AssertionError):
+                checks.f3(self.workdir())
+
+    def test_c1d_fails_when_staging_precedes_the_name_check(self) -> None:
+        checks = _load_checks()
+        name_check = (
+            "    if not valid_bundle_name(bundle_name):\n"
+            '        raise ValueError(f"invalid bundle name: {bundle_name!r}")\n'
+        )
+        start = "    published_ok = False\n    try:\n"
+        late = (
+            "        if not valid_bundle_name(bundle_name):\n"
+            '            raise ValueError(f"invalid bundle name: {bundle_name!r}")\n'
+        )
+        mutant = _mutant(
+            self.root, "packager.py", (name_check, ""), (start, start + late)
+        )
+        with patch.object(checks, "PACKAGER", str(mutant)):
+            with self.assertRaises(AssertionError):
+                checks.c1d(self.workdir())
+
+    def test_c1e_fails_when_evidence_is_read_before_the_device_check(self) -> None:
+        checks = _load_checks()
+        if checks.SECOND_FS is None:
+            self.skipTest("no second filesystem")
+        first_check = (
+            "        # Same-filesystem guarantee, asserted with real device numbers before\n"
+            "        # any write and again before the rename.\n"
+            "        if os.stat(staging).st_dev != os.stat(out_parent).st_dev:\n"
+            '            raise ValueError("cross-filesystem staging rejected")\n'
+        )
+        mutant = _mutant(self.root, "packager.py", (first_check, ""))
+        spec = importlib.util.spec_from_file_location("packager", mutant)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with patch.dict(sys.modules, {"packager": module}):
+            with self.assertRaises(AssertionError):
+                checks.c1e(self.workdir())
+
+    def test_c1e_leaves_second_filesystem_entries_it_did_not_create(self) -> None:
+        checks = _load_checks()
+        if checks.SECOND_FS is None:
+            self.skipTest("no second filesystem")
+        foreign = Path(
+            tempfile.mkdtemp(prefix=".staging-bundle-c1e-", dir=checks.SECOND_FS)
+        )
+
+        def remove_foreign() -> None:
+            if foreign.is_dir():
+                foreign.rmdir()
+
+        self.addCleanup(remove_foreign)
+        checks.c1e(self.workdir())
+        self.assertTrue(foreign.is_dir(), "C1-e removed another run's directory")
+
+    def test_r7_fails_on_timestamps_that_are_not_utc(self) -> None:
+        rc = _load_recorder_checks()
+        mutant = _mutant(
+            self.root,
+            "recorder.py",
+            (
+                "    return datetime.now(timezone.utc).isoformat()",
+                "    return datetime.now(timezone(timedelta(hours=5))).isoformat()",
+            ),
+            (
+                "from datetime import datetime, timezone",
+                "from datetime import datetime, timedelta, timezone",
+            ),
+        )
+        with patch.object(rc, "RECORDER", str(mutant)):
+            with self.assertRaises(AssertionError):
+                rc.r7(self.workdir())
+
+
+class EntryPointRegression(unittest.TestCase):
+    def test_main_guard_is_the_last_statement(self) -> None:
+        tree = ast.parse(Path(__file__).read_text())
+        guards = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.If) and "__main__" in ast.unparse(node.test)
+        ]
+        self.assertEqual(guards, [tree.body[-1]], "tests after the guard never run")
+
+
+if __name__ == "__main__":
+    unittest.main()

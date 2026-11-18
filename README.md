@@ -32,8 +32,10 @@ pushes to main. The disk-heavy R10 check remains local.
 - `docs/run-receipt-contract.txt` - the recorder's technical contract:
   receipt fields, guarantees, non-claims, usage, check definitions, and
   the dated qualification runs.
-- `tests/test_staging_regressions.py` - focused regression tests for the
-  sweep-inspection and staging-lock fixes.
+- `tests/test_staging_regressions.py` - focused regression tests: sweep
+  inspection, staging lock, own-staging cleanup, published-path and
+  path-resolution checks, recorder interrupts and git state, and the
+  gate checks' own witnesses.
 - `docs/requirements.md` and `docs/decisions.md` - the numbered
   requirements and the decision rows behind adopted changes.
 - `docs/qualification-evidence.md` - the November 10, 2026 evidence

@@ -22,10 +22,10 @@ declares, is INVALID. So unpublished staging, a copy under another name
 and a renamed bundle never validate.
 
 Fail-closed: absent path, missing/incomplete manifest, a manifest that is
-not a regular file, hash or size mismatch, unexpected extra files,
-symlinks or unreadable directories in the bundle, and unknown or
-malformed manifest framing all produce INVALID. Never emits VALID for a
-bundle it could not fully read.
+not a regular file, hash or size mismatch, unexpected extra files or
+empty directories, symlinks, unreadable directories or files in the
+bundle, and unknown or malformed manifest framing all produce INVALID.
+Never emits VALID for a bundle it could not fully read.
 
 Python 3 standard library only.
 """
@@ -72,6 +72,10 @@ def verify(bundle_path: str) -> Verdict:
     reasons: list[str] = []
     manifest_sha256: str | None = None
     bundle_name: str | None = None
+    # Check and read the same path the verdict names. The kernel resolves a
+    # '..' after a symlink differently from abspath, so the raw path could
+    # name another directory than the one bound and checked below.
+    bundle_path = os.path.abspath(bundle_path)
 
     if not os.path.isdir(bundle_path):
         reasons.append("bundle path absent or not a directory")
@@ -86,6 +90,9 @@ def verify(bundle_path: str) -> Verdict:
         manifest_mode = os.lstat(manifest_path).st_mode
     except FileNotFoundError:
         reasons.append("manifest.json missing")
+        return _verdict("INVALID", bundle_name, bundle_path, manifest_sha256, reasons)
+    except OSError as e:
+        reasons.append(f"manifest.json could not be inspected: {e.strerror}")
         return _verdict("INVALID", bundle_name, bundle_path, manifest_sha256, reasons)
     if not stat.S_ISREG(manifest_mode):
         reasons.append("manifest.json is not a regular file")
@@ -153,6 +160,10 @@ def verify(bundle_path: str) -> Verdict:
     unreadable: list[OSError] = []
     for root, dirs, fns in os.walk(bundle_path, onerror=unreadable.append):
         dirs.sort()
+        if root != bundle_path and not dirs and not fns:
+            # A directory holding no listed file is unaccounted for.
+            rel = os.path.relpath(root, bundle_path)
+            reasons.append(f"unexpected empty directory in bundle: {rel}")
         for dn in dirs:
             if os.path.islink(os.path.join(root, dn)):
                 rel = os.path.relpath(os.path.join(root, dn), bundle_path)
@@ -182,10 +193,14 @@ def verify(bundle_path: str) -> Verdict:
             continue
         h = hashlib.sha256()
         size = 0
-        with open(ap, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-                size += len(chunk)
+        try:
+            with open(ap, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+                    size += len(chunk)
+        except OSError as e:
+            reasons.append(f"listed file unreadable: {rel}: {e.strerror}")
+            continue
         if entry["sha256"] != h.hexdigest():
             reasons.append(f"hash mismatch: {rel}")
         elif entry["size"] != size:

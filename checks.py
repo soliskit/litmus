@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -136,16 +137,35 @@ def f2(t: str) -> str:
     return "verdict binds name, path and manifest sha256"
 
 
+def tree_state(root: str) -> dict[str, tuple[int, bytes]]:
+    """Every entry under root, root included, by inode and file bytes."""
+    state = {".": (os.lstat(root).st_ino, b"")}
+    for here, dirs, files in os.walk(root):
+        for name in dirs + files:
+            path = os.path.join(here, name)
+            st = os.lstat(path)
+            data = b""
+            if stat.S_ISREG(st.st_mode):
+                with open(path, "rb") as f:
+                    data = f.read()
+            state[os.path.relpath(path, root)] = (st.st_ino, data)
+    return state
+
+
 @check("F3 republish over an existing bundle is refused, no overwrite")
 def f3(t: str) -> str:
     make_evidence(t)
-    run([PACKAGER, os.path.join(t, "evidence"), t, "bundle-f3"])
-    marker = os.path.join(t, "bundle-f3", "evidence-0.log")
-    before = open(marker).read()
+    r = run([PACKAGER, os.path.join(t, "evidence"), t, "bundle-f3"])
+    assert r.returncode == 0, r.stderr
+    bp = os.path.join(t, "bundle-f3")
+    before = tree_state(bp)
     r = run([PACKAGER, os.path.join(t, "evidence"), t, "bundle-f3"])
     assert r.returncode == 1
-    assert open(marker).read() == before
-    return "refused, existing bundle untouched"
+    assert tree_state(bp) == before, "refused republish changed the existing bundle"
+    return (
+        f"refused; all {len(before)} entries of the existing bundle kept "
+        "their inode and bytes"
+    )
 
 
 @check("F4 no-overwrite race: EMPTY target appearing mid-run is never replaced")
@@ -250,13 +270,27 @@ def c1c(t: str) -> str:
 @check("C1-d path abuse names rejected before staging")
 def c1d(t: str) -> str:
     make_evidence(t)
+    # A read-only output parent: a packager that tried to allocate staging
+    # before refusing the name fails with an OS error instead of the name
+    # error, and its own cleanup of a failed pack cannot hide that.
+    parent = os.path.join(t, "read-only-parent")
+    os.makedirs(parent)
     bad_names = [".", "..", "", "a/b", ".staging-x", " ", "../x", "nl\n"]
-    for bad in bad_names:
-        r = run([PACKAGER, os.path.join(t, "evidence"), t, bad])
-        assert r.returncode == 1, repr(bad)
-    assert not [f for f in os.listdir(t) if f.startswith(".staging-")]
-    assert not os.path.exists(os.path.join(t, "nl\n")), "newline name published"
-    return f"{len(bad_names)} abusive names rejected, no staging created"
+    os.chmod(parent, 0o555)
+    try:
+        if os.access(parent, os.W_OK):
+            raise AssertionError("account bypasses read-only mode; run unprivileged")
+        for bad in bad_names:
+            r = run([PACKAGER, os.path.join(t, "evidence"), parent, bad])
+            assert r.returncode == 1, repr(bad)
+            assert "invalid bundle name" in r.stderr, (bad, r.stderr)
+    finally:
+        os.chmod(parent, 0o755)
+    assert os.listdir(parent) == [], os.listdir(parent)
+    return (
+        f"{len(bad_names)} abusive names refused with the name error while the "
+        "output parent was read-only, so no staging was attempted"
+    )
 
 
 @check("C1-e cross-filesystem staging rejected on a real second filesystem")
@@ -266,16 +300,40 @@ def c1e(t: str) -> str:
     make_evidence(t)
     if SECOND_FS is None:
         raise AssertionError("no second filesystem in this environment")
+    # Every evidence file unreadable: a packager that read evidence before
+    # the refusal fails with EACCES instead, and its own cleanup of a failed
+    # pack cannot hide that.
+    evidence = [
+        os.path.join(root, fn)
+        for root, _dirs, fns in os.walk(os.path.join(t, "evidence"))
+        for fn in fns
+    ]
+    # The second filesystem is shared: judge and remove only what this
+    # attempt leaves, never another run's entries.
+    before = set(os.listdir(SECOND_FS))
+    for path in evidence:
+        os.chmod(path, 0)
     try:
-        packager.pack(
-            os.path.join(t, "evidence"), t, "bundle-c1e", staging_parent=SECOND_FS
-        )
-        raise AssertionError("cross-fs staging accepted")
-    except ValueError as e:
-        assert "cross-filesystem" in str(e)
+        if any(os.access(path, os.R_OK) for path in evidence):
+            raise AssertionError("account bypasses mode 000; run unprivileged")
+        try:
+            packager.pack(
+                os.path.join(t, "evidence"), t, "bundle-c1e", staging_parent=SECOND_FS
+            )
+        except ValueError as e:
+            assert "cross-filesystem" in str(e), str(e)
+        except OSError as e:
+            raise AssertionError(f"evidence read before the refusal: {e}") from e
+        else:
+            raise AssertionError("cross-fs staging accepted")
+    finally:
+        for path in evidence:
+            os.chmod(path, 0o644)
     assert not os.path.exists(os.path.join(t, "bundle-c1e"))
     leftover = [
-        f for f in os.listdir(SECOND_FS) if f.startswith(".staging-bundle-c1e-")
+        f
+        for f in os.listdir(SECOND_FS)
+        if f.startswith(".staging-bundle-c1e-") and f not in before
     ]
     for f in leftover:
         sp = os.path.join(SECOND_FS, f)
@@ -283,8 +341,10 @@ def c1e(t: str) -> str:
         os.rmdir(sp)
     return (
         f"real cross-device attempt (staging on {SECOND_FS}, publish target "
-        f"{t}) rejected; the {len(leftover)} staging dir(s) the refusal left "
-        "on the wrong device held no evidence, and the gate removed them"
+        f"{t}) rejected before any evidence was read: with every evidence "
+        "file unreadable the refusal was the cross-filesystem error; the "
+        f"{len(leftover)} staging dir(s) the refusal left on the wrong device "
+        "held no evidence, and the gate removed them"
     )
 
 
