@@ -12,6 +12,7 @@ certifies nothing about any other system, suite, or property.
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import signal
 import stat
@@ -309,7 +310,10 @@ def c1e(t: str) -> str:
         for fn in fns
     ]
     # The second filesystem is shared: judge and remove only what this
-    # attempt leaves, never another run's entries.
+    # attempt leaves, never another run's entries. A per-attempt random
+    # bundle name makes this attempt's staging prefix unique, so a
+    # concurrent run's staging can never match it.
+    name = "bundle-c1e-" + secrets.token_hex(8)
     before = set(os.listdir(SECOND_FS))
     for path in evidence:
         os.chmod(path, 0)
@@ -318,7 +322,7 @@ def c1e(t: str) -> str:
             raise AssertionError("account bypasses mode 000; run unprivileged")
         try:
             packager.pack(
-                os.path.join(t, "evidence"), t, "bundle-c1e", staging_parent=SECOND_FS
+                os.path.join(t, "evidence"), t, name, staging_parent=SECOND_FS
             )
         except ValueError as e:
             assert "cross-filesystem" in str(e), str(e)
@@ -329,11 +333,11 @@ def c1e(t: str) -> str:
     finally:
         for path in evidence:
             os.chmod(path, 0o644)
-    assert not os.path.exists(os.path.join(t, "bundle-c1e"))
+    assert not os.path.exists(os.path.join(t, name))
     leftover = [
         f
         for f in os.listdir(SECOND_FS)
-        if f.startswith(".staging-bundle-c1e-") and f not in before
+        if f.startswith(f".staging-{name}-") and f not in before
     ]
     for f in leftover:
         sp = os.path.join(SECOND_FS, f)
@@ -664,6 +668,13 @@ def c3c(t: str) -> str:
 
 
 def main() -> int:
+    if not __debug__:
+        print(
+            "REFUSED: assertions are disabled (python -O or PYTHONOPTIMIZE); "
+            "every check is an assert, so no PASS line would mean anything.",
+            file=sys.stderr,
+        )
+        return 2
     pins = source_pins()
     print("source pins (bytes under test):")
     for f, h in sorted(pins.items()):

@@ -147,7 +147,10 @@ def _git(cwd: str, *args: str) -> "subprocess.CompletedProcess[str]":
     reaches it, and the fsmonitor that could vouch for files is off. No
     core.excludesFile, nor the user-level ignore file git reads when that is
     unset, can hide untracked files; the repository's own ignore rules
-    still apply."""
+    still apply. core.ignoreCase is pinned false so a user-level setting
+    cannot fold an untracked file into a tracked one that differs only by
+    case; on a case-insensitive filesystem this can only mark more trees
+    dirty, never fewer."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     return subprocess.run(
         [
@@ -156,6 +159,8 @@ def _git(cwd: str, *args: str) -> "subprocess.CompletedProcess[str]":
             "core.fsmonitor=false",
             "-c",
             f"core.excludesFile={os.devnull}",
+            "-c",
+            "core.ignoreCase=false",
             "-C",
             cwd,
             *args,

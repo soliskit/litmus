@@ -51,7 +51,9 @@ pushes to main. The disk-heavy R10 check remains local.
   visibility; the recorder publishes with two no-overwrite hard links
   instead. Any other platform, architecture, process width, or a kernel
   without renameat2 fails closed for the packager: publish is refused.
-  The contracts state the exact boundaries.
+  The recorder gate anchors the processes it cleans up with pidfds, so
+  it additionally requires kernel 5.3+ (pidfd_open); the tools
+  themselves do not. The contracts state the exact boundaries.
 
 ## Use
 

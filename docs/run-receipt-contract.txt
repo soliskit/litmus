@@ -144,26 +144,21 @@ CHECK DEFINITIONS (what the gate's 10 checks verify)
   snapshot whose hash matches the published log.
 
 QUALIFICATION RUNS
-November 14, 2026: the 10-check gate passed 10 of 10 on the current
-sources via bare `python3 recorder-checks.py` startup, using CPython
+November 17, 2026: the 10-check gate passed 10 of 10 on the sources of
+this change via bare `python3 recorder-checks.py` startup, using CPython
+3.10.12 on unprivileged Linux x86-64. R10 ran locally under its
+bounded controls and terminated in 2.8 s with a bounded
+846,200,832-byte snapshot whose hash matches; no gate temp files
+remained after the run. The same tree passed the 51 unit tests, ruff
+check, ruff format --check (13 files) and mypy (6 source files).
+
+November 14, 2026: the 10-check gate passed 10 of 10 on the sources of
+that date via bare `python3 recorder-checks.py` startup, using CPython
 3.10.12 on unprivileged Linux x86-64. R10 ran locally under its
 bounded controls and terminated in 6.1 s with a bounded
 3,665,821,696-byte snapshot whose hash matches. CI still runs R1-R9
 with RECORDER_CHECKS_SKIP=R10; this local run does not change that
 coverage.
-
-November 12, 2026: the 10-check gate passed 10 of 10 on the current
-sources via bare `python3 recorder-checks.py` startup, using CPython
-3.10.12 on unprivileged Linux x86-64.
-
-- CI qualification: on each pull request and push to main, R1-R9 run on
-  GitHub-hosted runners with RECORDER_CHECKS_SKIP=R10. R10 is excluded in
-  CI: its flood's disk fit on a 14 GB runner is unverified. The variable
-  accepts only "R10"; any other value refuses the run. A skipped check
-  prints "skipped by RECORDER_CHECKS_SKIP; no qualification claimed", so
-  every CI log names the gap. R10 keeps qualifying locally under the
-  bounded controls after any edit to recorder.py or recorder-checks.py;
-  the dated entries above record those runs.
 
 November 13, 2026: the 10-check gate passed 10 of 10 on the sources of
 this change (the RECORDER_CHECKS_SKIP mechanism added), via bare
@@ -175,6 +170,21 @@ cleanup audit. The skip mechanism was verified live the same day:
 an unknown or non-R10 value refuses with exit 2 before anything runs;
 RECORDER_CHECKS_SKIP=R10 ran R1-R9, printed the SKIP line, and exited 0
 with "10 checks, 0 failures, 1 skipped".
+
+November 12, 2026: the 10-check gate passed 10 of 10 on the sources of
+that date via bare `python3 recorder-checks.py` startup, using CPython
+3.10.12 on unprivileged Linux x86-64.
+
+- CI qualification: on each pull request and push to main, R1-R9 run on
+  GitHub-hosted runners with RECORDER_CHECKS_SKIP=R10. R10 is excluded in
+  CI: its flood's disk fit on a 14 GB runner is unverified. The variable
+  accepts only "R10"; any other value refuses the run. A skipped check
+  prints "skipped by RECORDER_CHECKS_SKIP; no qualification claimed", so
+  every CI log names the gap. R10 keeps qualifying locally under the
+  bounded controls after any edit to recorder.py or recorder-checks.py;
+  the dated entries above record those runs. The gate also refuses to
+  run with assertions disabled (python -O / PYTHONOPTIMIZE): exit 2, no
+  PASS claimed.
 
 Re-qualify with: python3 recorder-checks.py (10 checks; exit 0 means all
 pass). After any edit to the tool files, re-run the gate.
