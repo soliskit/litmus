@@ -13,7 +13,10 @@ COMPONENTS
   complete validation of the exact bundle it names, and it binds the
   manifest-DECLARED bundle name, the bundle's absolute path, and the
   bundle's manifest sha256. A verdict for an absent, moved, renamed, or
-  changed bundle is invalid on its face.
+  changed bundle is invalid on its face. The absolute path is the
+  lexically normalized one (as os.path.abspath forms it), and it is
+  the path checked and read; the packager publishes into the
+  normalized OUT_PARENT it reports.
 - checks.py (gate): 16 checks over the packager and verifier, using real
   mechanisms only: real SIGKILLs of a real subprocess, a real OS write
   error, and a real second filesystem for the cross-device case.
@@ -56,13 +59,15 @@ GUARANTEES
   entries hold exactly sha256 (64 lowercase hex) and size (a
   non-negative integer); any other key is unknown framing. manifest.json
   must be a regular file. Every entry in the bundle is accounted for: a
-  symlink, an unreadable directory or an unlisted file makes the bundle
-  invalid. Stale verdicts (changed evidence)
-  and foreign verdicts (different bundle) are rejected against the
-  current bytes and identity. An evidence file named manifest.json is
-  refused as input (reserved-name collision). So is evidence that cannot
+  symlink, an unreadable directory or file, an unlisted file or an
+  empty directory makes the bundle invalid, never a crash. Stale
+  verdicts (changed evidence) and foreign verdicts (different bundle)
+  are rejected against the current bytes and identity. An evidence
+  file named manifest.json is refused as input (reserved-name
+  collision). So is evidence that cannot
   be packed whole: a symlinked file or directory, any other non-regular
-  entry, or a directory that cannot be read; nothing under the evidence
+  entry, a directory that cannot be read, or an empty directory, which
+  the manifest cannot carry; nothing under the evidence
   directory is skipped. Abusive bundle names are
   rejected before any staging is created. Staging on a different
   filesystem than the publish target is rejected before any evidence

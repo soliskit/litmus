@@ -11,6 +11,7 @@ about any run the recorder records.
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -499,11 +500,13 @@ def r7(t: str) -> str:
     receipt, _raw = read_receipt(rp)
     assert set(receipt) == recorder.RECEIPT_FIELDS
     assert set(receipt["output"]) == recorder.OUTPUT_FIELDS
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     started = datetime.fromisoformat(receipt["started"])
     ended = datetime.fromisoformat(receipt["ended"])
-    assert started.tzinfo is not None and ended.tzinfo is not None
+    # UTC, not merely timezone-aware: any other offset breaks the receipt.
+    assert started.utcoffset() == timedelta(0), receipt["started"]
+    assert ended.utcoffset() == timedelta(0), receipt["ended"]
     # No ordering check: started and ended are wall clock, which can step
     # backward during a run. Only runtime_seconds is monotonic.
     assert receipt["runtime_seconds"] >= 0
@@ -651,6 +654,8 @@ def main() -> int:
         except Exception as e:
             failures += 1
             print(f"FAIL {name}: {e}")
+        finally:
+            shutil.rmtree(t, ignore_errors=True)
     print(f"{len(CHECKS)} checks, {failures} failures, {skipped} skipped")
     return 1 if failures else 0
 

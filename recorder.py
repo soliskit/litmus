@@ -35,7 +35,9 @@ Honesty boundaries:
 - SIGINT, SIGTERM or SIGHUP to the recorder while the run is live sends
   the same real SIGKILL to the run's whole process group; no receipt is
   published and the recorder exits 128 plus the signal number. A missing
-  receipt never hides a live run.
+  receipt never hides a live run. An interrupt after the receipt link
+  also exits 128 plus the signal number and says the receipt was
+  published.
 
 No root, no mounts, no environment mechanics. Python 3 standard library
 only. git is used only to read HEAD and worktree state.
@@ -85,7 +87,18 @@ class Interrupted(Exception):
         self.signum = signum
 
 
+# The live run's process group, set only while the run is live. The handler
+# kills it before raising: a further interrupt can cut short any Python code
+# that runs after this exception is raised, but never a kill already done.
+_live_group: int | None = None
+# The receipt path this process has published. It is set with interrupts
+# held, so an interrupt is reported against the exact publication state.
+_published: str | None = None
+
+
 def _raise_interrupted(signum: int, _frame: object) -> None:
+    if _live_group is not None:
+        _kill_group(_live_group)
     raise Interrupted(signum)
 
 
@@ -131,10 +144,22 @@ def _utcnow() -> str:
 def _git(cwd: str, *args: str) -> "subprocess.CompletedProcess[str]":
     """Run git on cwd's own repository and work tree. GIT_* variables such
     as GIT_DIR or GIT_WORK_TREE would point git at other state, so none
-    reaches it, and the fsmonitor that could vouch for files is off."""
+    reaches it, and the fsmonitor that could vouch for files is off. No
+    core.excludesFile, nor the user-level ignore file git reads when that is
+    unset, can hide untracked files; the repository's own ignore rules
+    still apply."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     return subprocess.run(
-        ["git", "-c", "core.fsmonitor=false", "-C", cwd, *args],
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            f"core.excludesFile={os.devnull}",
+            "-C",
+            cwd,
+            *args,
+        ],
         capture_output=True,
         text=True,
         timeout=30,
@@ -197,6 +222,7 @@ def record(
     """Run argv once and publish the pair by two atomic no-overwrite
     hard links, log first then receipt. Returns the receipt dict.
     Raises on any recorder-level failure; no receipt is published then."""
+    global _live_group, _published
     receipt_path = os.path.abspath(receipt_path)
     parent = os.path.dirname(receipt_path)
     receipt_name = os.path.basename(receipt_path)
@@ -239,6 +265,7 @@ def record(
         except BaseException:
             signal.pthread_sigmask(signal.SIG_SETMASK, mask)
             raise
+        _live_group = proc.pid  # still masked: no handler runs before this
         try:
             signal.pthread_sigmask(signal.SIG_SETMASK, mask)
             try:
@@ -253,6 +280,8 @@ def record(
             _kill_group(proc.pid)
             proc.wait()
             raise
+        finally:
+            _live_group = None
     ended = _utcnow()
     runtime = time.monotonic() - t0
 
@@ -304,20 +333,43 @@ def record(
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
-    os.fsync(os.open(staged_log, os.O_RDONLY))
+    log_fd = os.open(staged_log, os.O_RDONLY)
+    try:
+        os.fsync(log_fd)
+    finally:
+        os.close(log_fd)
 
     # Publish: log first, then the receipt, each one atomic no-overwrite
     # hard link. After the receipt link the pair is complete; before it,
     # an orphaned log carries no meaning.
-    os.link(staged_log, os.path.join(parent, log_name))
+    published_log = os.path.join(parent, log_name)
+    os.link(staged_log, published_log)
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, [])
     try:
-        os.link(staged_receipt, receipt_path)
-    except OSError:
-        os.unlink(os.path.join(parent, log_name))
-        raise
-    os.unlink(staged_log)
-    os.unlink(staged_receipt)
-    os.rmdir(staging)
+        signal.pthread_sigmask(signal.SIG_BLOCK, INTERRUPT_SIGNALS)
+        try:
+            os.link(staged_receipt, receipt_path)
+        except OSError:
+            try:
+                os.unlink(published_log)
+            except OSError as cleanup_error:
+                # Keep the link error: it is why there is no receipt.
+                print(
+                    f"warning: published log not removed ({cleanup_error}); "
+                    "it carries no meaning without its receipt",
+                    file=sys.stderr,
+                )
+            raise
+        _published = receipt_path
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+    # The pair is published. A staging cleanup failure is a warning only.
+    try:
+        os.unlink(staged_log)
+        os.unlink(staged_receipt)
+        os.rmdir(staging)
+    except OSError as e:
+        print(f"warning: staging cleanup failed after publish: {e}", file=sys.stderr)
     return receipt
 
 
@@ -375,14 +427,17 @@ def main(argv: list[str]) -> int:
         signal.signal(signum, _raise_interrupted)
     try:
         receipt = record(receipt_path, command, cwd, timeout_seconds, commit_override)
+        print(json.dumps(receipt, indent=2, sort_keys=True))
     except Interrupted as e:
-        error = f"{e}; any live run's process group was killed; no receipt"
+        if _published == os.path.abspath(receipt_path):
+            error = f"{e} after the run ended and its receipt was published"
+        else:
+            error = f"{e}; any live run's process group was killed; no receipt"
         print(json.dumps({"error": error}), file=sys.stderr)
         return 128 + e.signum
     except Exception as e:
         print(json.dumps({"error": str(e)}), file=sys.stderr)
         return 1
-    print(json.dumps(receipt, indent=2, sort_keys=True))
     if receipt["timed_out"]:
         return 124
     if receipt["exit"] is not None:

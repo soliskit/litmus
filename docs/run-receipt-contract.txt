@@ -22,8 +22,11 @@ RECEIPT FIELDS (version 1; the exact set, no more and no fewer)
   core.worktree) refuses the run.
 - worktree_clean: true or false from git status at launch, with
   untracked files and submodules always included whatever git config
-  says; false also when any index entry is marked assume-unchanged or
-  skip-worktree, since git status does not look at those files (a
+  says (no core.excludesFile, nor the user-level ignore file git reads
+  when that is unset, hides a file; the repository's own .gitignore
+  files and .git/info/exclude still apply); false also when any index
+  entry is marked assume-unchanged or skip-worktree, since git status
+  does not look at those files (a
   sparse checkout therefore records false); null when the commit came
   from --commit, where the recorder establishes nothing about the
   worktree.
@@ -69,12 +72,15 @@ GUARANTEES
   can race the kill. The recorder exits 124 whenever timed_out is
   true.
 - Exit propagation. Otherwise the recorder exits with the run's own
-  code, or 128 plus the signal number when a signal ended the run.
+  code, or 128 plus the signal number when a signal ended the run. A
+  staging cleanup failure after publication is a warning only.
 - Interrupt. SIGINT, SIGTERM or SIGHUP sent to the recorder while the
   run is live sends a real SIGKILL to the run's whole process group;
   no receipt is published and the recorder exits 128 plus the signal
-  number. A missing receipt never hides a live run. An interrupt after
-  the run ended can leave a log without its receipt.
+  number. A missing receipt never hides a live run, and a further
+  interrupt cannot cancel the kill. An interrupt after the run ended
+  can leave a log without its receipt; one after the receipt link
+  exits 128 plus the signal number and says the receipt was published.
 
 NON-CLAIMS
 - A receipt records ONE OBSERVED run. It is not a minimum-runtime
@@ -125,8 +131,8 @@ CHECK DEFINITIONS (what the gate's 10 checks verify)
   untracked file behind status.showUntrackedFiles=no; a GIT_DIR naming
   another repository changes neither commit nor worktree_clean, and a
   work tree moved by core.worktree is refused.
-- R7: the receipt carries exactly the schema's fields, the UTC
-  timestamps parse (their order is not checked: they are wall clock),
+- R7: the receipt carries exactly the schema's fields, the timestamps
+  are UTC and parse (their order is not checked: they are wall clock),
   and the printed receipt equals the published file.
 - R8: the published log is frozen: a background descendant's later
   output never changes it, and the receipt hash still matches.
