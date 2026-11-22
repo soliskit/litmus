@@ -649,12 +649,41 @@ def r10(t: str) -> str:
 
     repo = make_repo(t)
     writer = os.path.join(t, "flood-writer.py")
+    # Two-phase runaway writer. Phase 1 is a fixed-size pre-freeze flood
+    # (byte-capped, and time-capped at 0.35s so it ends about 0.15s before
+    # the launcher's 0.5s sleep can end - a timing margin, not a startup
+    # guarantee). Phase 2 waits for the freeze and then appends a marker
+    # phase: the freeze is detected by the staged path's inode changing,
+    # which happens when the recorder re-creates it for the bounded copy,
+    # strictly after the cutoff is fixed, so marker bytes can only land
+    # beyond the cutoff. Whether a read past the cutoff is caught is
+    # checked by a negative control on the actual machine, not assumed.
+    # The writer exits on its own once the recorder's staging dirs are
+    # gone (completion, gate-kill cleanup, or a missed detection alike).
+    staging_glob = os.path.join(t, ".receipt-*")
+    log_glob = os.path.join(staging_glob, "runaway.json.log")
     with open(writer, "w") as f:
         f.write(
-            "import os, time\n"
+            "import glob, os, time\n"
+            "mine = os.fstat(1).st_ino\n"
             "t0 = time.monotonic()\n"
-            "while time.monotonic() - t0 < 10:\n"
-            "    os.write(1, b'x' * 1048576)\n"
+            "sent = 0\n"
+            "while sent < 134217728 and time.monotonic() - t0 < 0.35:\n"
+            "    sent += os.write(1, b'x' * 1048576)\n"
+            "frozen = False\n"
+            "while not frozen and time.monotonic() - t0 < 45:\n"
+            f"    if not glob.glob({staging_glob!r}):\n"
+            "        break\n"
+            f"    for p in glob.glob({log_glob!r}):\n"
+            "        try:\n"
+            "            frozen = os.stat(p).st_ino != mine\n"
+            "        except OSError:\n"
+            "            pass\n"
+            "    time.sleep(0.002)\n"
+            "if frozen:\n"
+            "    sent = 0\n"
+            "    while sent < 33554432 and time.monotonic() - t0 < 45:\n"
+            "        sent += os.write(1, b'y' * 1048576)\n"
         )
     launcher = os.path.join(t, "flood-launcher.py")
     with open(launcher, "w") as f:
@@ -685,9 +714,18 @@ def r10(t: str) -> str:
     size = os.path.getsize(rp + ".log")
     assert receipt["output"]["sha256"] == recorder._sha256_file(rp + ".log")
     assert receipt["output"]["bytes"] == size
+    with open(rp + ".log", "rb") as f:
+        published = f.read()
+    assert b"y" not in published, (
+        "published log holds post-freeze bytes: the cutoff did not hold "
+        "(unbounded read of a growing log)"
+    )
     os.unlink(rp)
-    os.unlink(rp + ".log")  # large snapshot; do not litter it
-    return f"terminated in {dt:.1f}s with a bounded {size}-byte snapshot; hash matches"
+    os.unlink(rp + ".log")  # snapshot; do not litter it
+    return (
+        f"terminated in {dt:.1f}s with a bounded {size}-byte snapshot; "
+        "hash matches and no post-freeze marker byte was published"
+    )
 
 
 SKIP_ENV = "RECORDER_CHECKS_SKIP"
